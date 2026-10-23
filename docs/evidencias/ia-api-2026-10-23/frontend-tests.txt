@@ -1,0 +1,32 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> frontend@0.0.0 test:ia
+> node --experimental-strip-types --test tests/ia.test.mjs
+
+✔ Acepta un dictamen válido conservando las advertencias (2.042591ms)
+✔ Rechaza contrato inválido null (0.600972ms)
+✔ Rechaza contrato inválido "" (0.121333ms)
+✔ Rechaza contrato inválido {} (0.099291ms)
+✔ Rechaza contrato inválido {"puntaje":null,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"]} (0.154975ms)
+✔ Rechaza contrato inválido {"puntaje":null,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"]} (0.133182ms)
+✔ Rechaza contrato inválido {"puntaje":101,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"]} (0.167333ms)
+✔ Rechaza contrato inválido {"puntaje":35,"viabilidad":"ALTA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"]} (0.343024ms)
+✔ Rechaza contrato inválido {"puntaje":35,"viabilidad":"BAJA","justificacion":" ","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"]} (0.149163ms)
+✔ Rechaza contrato inválido {"puntaje":35,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":[""],"recomendaciones":["Revisión humana"]} (0.175612ms)
+✔ Rechaza contrato inválido {"puntaje":35,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":[10]} (0.161208ms)
+✔ Rechaza contrato inválido {"puntaje":35,"viabilidad":"BAJA","justificacion":"Requiere revisión de documentos técnicos.","observaciones":["Sin expediente"],"recomendaciones":["Revisión humana"],"secreto":"dato ajeno"} (0.167384ms)
+✔ Límite 0 corresponde a BAJA (0.893103ms)
+✔ Límite 39.9 corresponde a BAJA (1.459985ms)
+✔ Límite 40 corresponde a MEDIA (0.168429ms)
+✔ Límite 69.9 corresponde a MEDIA (0.524783ms)
+✔ Límite 70 corresponde a ALTA (0.090757ms)
+✔ Límite 100 corresponde a ALTA (0.120326ms)
+✔ Reconoce EXP y UUID sin aceptar texto arbitrario (0.868639ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 376.163622

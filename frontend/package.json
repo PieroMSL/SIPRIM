@@ -8,7 +8,8 @@
     "typecheck": "tsc -b",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:ia": "node --experimental-strip-types --test tests/ia.test.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

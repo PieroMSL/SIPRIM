@@ -11,6 +11,7 @@ import type {
 } from '../types/pmv1'
 import { isExpedienteUuid } from '../utils/expedienteRef'
 import { apiFetch } from './client'
+import { parseDictamenIA, type DictamenIA } from '../features/ia/dictamen'
 
 export function createProject(payload: PMV1ProjectCreate): Promise<PMV1ProjectResponse> {
   return apiFetch<PMV1ProjectResponse>('/api/v1/projects', {
@@ -39,18 +40,13 @@ export async function resolveProject(ref: string): Promise<PMV1ProjectResponse> 
   return getProjectByCode(query)
 }
 
-export function evaluateProjectWithIA(projectId: string): Promise<{
-  puntaje: number
-  viabilidad: 'ALTA' | 'MEDIA' | 'BAJA'
-  justificacion: string
-  observaciones: string[]
-  recomendaciones: string[]
-}> {
-  return apiFetch(`/api/v1/projects/${projectId}/evaluacion-ia`, {
+export async function evaluateProjectWithIA(projectId: string): Promise<DictamenIA> {
+  const response = await apiFetch<unknown>(`/api/v1/projects/${projectId}/evaluacion-ia`, {
     method: 'POST',
     auth: true,
     timeoutMs: 60_000,
   })
+  return parseDictamenIA(response)
 }
 
 export function validateProject(projectId: string): Promise<PMV1ValidationResponse> {

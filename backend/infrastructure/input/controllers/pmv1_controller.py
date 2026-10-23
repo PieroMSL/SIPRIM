@@ -2,8 +2,9 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, status
+from pydantic import ValidationError
 
-from backend.application.dto.evaluacion_ia_dto import DictamenIAResponse
+from backend.application.dto.evaluacion_ia_dto import DictamenIAResponse, FichaTecnicaIA
 from backend.application.dto.pmv1_dto import (
     EvaluationAccepted,
     EvaluationCreate,
@@ -127,6 +128,19 @@ async def evaluar_proyecto_pmv1_ia(
         "beneficiarios": project["beneficiaries_count"],
         "tipo_proyecto": project["proposed_land_use"],
     }
+    # Validar tambien magnitudes y espacios. Antes llegaban al grafo y producian
+    # un error interno en vez de una observacion del expediente.
+    field_names = {
+        "nombre": "title", "descripcion": "description", "ubicacion": "location",
+        "tipo_proyecto": "proposed_land_use", "presupuesto": "estimated_budget_pen",
+        "beneficiarios": "beneficiaries_count",
+    }
+    try:
+        validated = FichaTecnicaIA.model_validate({key: ficha[key] for key in field_names})
+    except ValidationError as exc:
+        invalid = list(dict.fromkeys(field_names[str(error["loc"][0])] for error in exc.errors()))
+        raise ExpedientePMV1IncompletoError(invalid) from None
+    ficha.update(validated.model_dump())
     try:
         dictamen = await ia_service.generar_dictamen(ficha)
     except IAError as exc:

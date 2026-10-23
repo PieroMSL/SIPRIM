@@ -5,14 +5,7 @@ import { ExpedienteCodeBadge } from '../../components/proyecto/ExpedienteCodeBad
 import { isValidExpedienteLookup, normalizeExpedienteQuery } from '../../utils/expedienteRef'
 import { mapPmV1ToProyecto } from '../../utils/pmv1Mapper'
 import type { Proyecto } from '../../types/proyecto'
-
-interface DictamenIA {
-  puntaje: number
-  viabilidad: 'ALTA' | 'MEDIA' | 'BAJA'
-  justificacion: string
-  observaciones: string[]
-  recomendaciones: string[]
-}
+import type { DictamenIA } from './dictamen'
 
 export function GeminiIntegrationPage() {
   const [rawRef, setRawRef] = useState('')

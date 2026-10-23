@@ -1,0 +1,19 @@
+{
+  "fecha_utc": "2026-10-23T21:37:11.826446+00:00",
+  "casos": [
+    {
+      "caso": "Credencial deliberadamente inválida contra proveedor real",
+      "codigo": "IA_AUTH_ERROR",
+      "mensaje": "Gemini rechazo las credenciales del servicio.",
+      "clase": "IAAuthenticationError",
+      "segundos": 4.92
+    },
+    {
+      "caso": "Límite temporal local real sin sustitución del proveedor",
+      "codigo": "IA_TIMEOUT",
+      "mensaje": "El servicio IA excedio el tiempo de espera.",
+      "clase": "IATimeoutError",
+      "segundos": 0.039
+    }
+  ]
+}

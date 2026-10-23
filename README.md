@@ -289,3 +289,11 @@ integración, pero el recorrido normal no realiza solicitudes al backend.
 
 Los PDF y materiales de referencia del proyecto van en la carpeta [`docs/`](docs/).
 Consulta [`docs/README.md`](docs/README.md) para el índice de archivos.
+
+### Validación de integración IA/API
+
+La guía [IA_API_VALIDACION.md](docs/IA_API_VALIDACION.md) contiene pruebas de
+fallos, contrato técnico, verificación EXP/UUID contra una API real y límites
+de la evidencia. Ejecutar `pytest` y `npm --prefix frontend run test:ia` para los
+controles automáticos. Los tests no necesitan una clave Gemini ni representan
+resultados de validación profesional de proyectos.

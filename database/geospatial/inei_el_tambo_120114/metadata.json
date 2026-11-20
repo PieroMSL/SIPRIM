@@ -1,0 +1,13 @@
+{
+  "source": "INEI GeoServer Interoperabilidad, ig_distrito",
+  "ubigeo": "120114",
+  "district": "EL TAMBO",
+  "source_record_date": "2022-07-22T01:39:29Z",
+  "original_vertices": 721,
+  "simplified_vertices": 392,
+  "tolerance_m": 10,
+  "area_drift_fraction": 5.283973005173662e-05,
+  "raw_sha256": "71591b5a5491e102f8cc81084fcde8e84564685352b3b2538fcde8e9fe64928b",
+  "simplified_sha256": "dc265829f26fd8724d19169648a180a0bc35e1b7baad8e62cdecea5e374c96b2",
+  "note": "Administrative district boundary only; not proof of beneficiaries or project influence area."
+}

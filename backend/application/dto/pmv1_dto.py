@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -24,6 +26,60 @@ class LoginResponse(BaseModel):
     roles: list[str]
 
 
+class RoleCatalogItemResponse(BaseModel):
+    code: str
+    name: str
+    privileged: bool = False
+
+
+class MunicipalUserResponse(BaseModel):
+    id: UUID
+    email: str
+    full_name: str
+    is_active: bool
+    roles: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminUsersListResponse(BaseModel):
+    users: list[MunicipalUserResponse]
+    available_roles: list[RoleCatalogItemResponse]
+
+
+class UserRolesUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    roles: list[str] = Field(default_factory=list)
+
+    @field_validator("roles")
+    @classmethod
+    def validate_roles(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            code = raw.strip().upper()
+            if not code:
+                raise ValueError("El codigo de rol no puede estar vacio")
+            if code in seen:
+                raise ValueError(f"Rol duplicado en la solicitud: {code}")
+            seen.add(code)
+            normalized.append(code)
+        return normalized
+
+
+class UserRolesUpdateResponse(BaseModel):
+    user: MunicipalUserResponse
+    message: str
+
+
+class CurrentUserMeResponse(BaseModel):
+    user_id: UUID
+    email: str
+    full_name: str
+    is_active: bool
+    roles: list[str]
+
+
 class PMV1ProjectCreate(BaseModel):
     """Expediente mínimo persistido por ms-platform según el PMV1."""
 
@@ -35,6 +91,12 @@ class PMV1ProjectCreate(BaseModel):
     description: str | None = Field(default=None, max_length=4000)
     location: str | None = Field(default=None, max_length=300)
     proposed_land_use: str | None = Field(default=None, max_length=150)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    coordinates_origin: Literal[
+        "declared", "official_cadastre", "field_survey", "public", "simulated"
+    ] | None = None
+    coordinates_source: str | None = Field(default=None, max_length=240)
     estimated_budget_pen: Decimal | None = Field(
         default=None, max_digits=18, decimal_places=2
     )
@@ -46,13 +108,36 @@ class PMV1ProjectCreate(BaseModel):
         return value.strip().upper() if value else value
 
     @field_validator(
-        "title", "description", "location", "proposed_land_use", mode="before"
+        "title",
+        "description",
+        "location",
+        "proposed_land_use",
+        "coordinates_source",
+        mode="before",
     )
     @classmethod
     def strip_text(cls, value: object) -> object:
         if isinstance(value, str):
             return value.strip() or None
         return value
+
+    @model_validator(mode="after")
+    def validate_coordinates_pair(self) -> "PMV1ProjectCreate":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("Debe proporcionar tanto latitud como longitud, o dejar ambas vacias")
+        if self.latitude is not None:
+            source = (self.coordinates_source or "").strip()
+            if len(source) < 3:
+                raise ValueError(
+                    "Debe indicar una fuente verificable (coordinates_source, min. 3 caracteres) para registrar coordenadas"
+                )
+            self.coordinates_source = source
+            if self.coordinates_origin is None:
+                self.coordinates_origin = "declared"
+        else:
+            self.coordinates_origin = None
+            self.coordinates_source = None
+        return self
 
 
 
@@ -166,6 +251,10 @@ class PMV1ProjectResponse(BaseModel):
     location: str | None
     proposed_land_use: str | None
     territorial_data_origin: str
+    latitude: float | None = None
+    longitude: float | None = None
+    coordinates_origin: str | None = None
+    coordinates_source: str | None = None
     estimated_budget_pen: Decimal
     beneficiaries_count: int
     checkpoint: CheckpointResponse | None = None
@@ -684,6 +773,345 @@ class UnifiedAssessmentSummaryResponse(BaseModel):
     global_score: GlobalScoreExplanation
     allows_final_approval: bool = Field(description="True si está habilitado para avanzar a dictamen final")
     blocking_reasons: list[str] = Field(default_factory=list, description="Motivos de detención o bloqueo si los hay")
+    generated_at: datetime
+
+
+class RankingProjectItem(BaseModel):
+    """Elemento comparable del ranking de priorizacion en mapa (HU4.1)."""
+
+    rank_position: int = Field(ge=1)
+    project_id: UUID
+    project_version_id: UUID
+    code: str
+    version_number: int
+    title: str
+    status: str
+    location: str | None = None
+    estimated_budget_pen: Decimal
+    beneficiaries_count: int
+    global_score: float
+    formula: str
+    explanation: str
+    criteria_version_number: int
+    weights: dict[str, float] = Field(default_factory=dict)
+    input_scores: dict[str, float] = Field(default_factory=dict)
+    tie_break_reason: str | None = None
+    has_coordinates: bool
+    latitude: float | None = None
+    longitude: float | None = None
+    coordinates_origin: str | None = None
+    coordinates_source: str | None = None
+    allows_final_approval: bool
+    geospatial_layers_count: int = 0
+
+
+class NonComparableProjectItem(BaseModel):
+    """Expediente excluido del orden numerico por evaluacion incompleta, bloqueada o no comparable."""
+
+    project_id: UUID
+    project_version_id: UUID
+    code: str
+    version_number: int
+    title: str
+    status: str
+    exclusion_code: Literal[
+        "incomplete", "blocked", "criteria_version_mismatch", "no_active_criteria"
+    ]
+    exclusion_reason: str
+    missing_dimensions: list[str] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+    has_coordinates: bool
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class ProjectMapRankingResponse(BaseModel):
+    """Respuesta consolidada de ranking y mapa de proyectos (HU4.1)."""
+
+    is_recommendation: bool = True
+    recommendation_notice: str
+    criteria_version_id: UUID | None = None
+    criteria_version_number: int | None = None
+    total_projects: int
+    comparable_count: int
+    mapped_count: int
+    unmapped_count: int
+    excluded_count: int
+    ranked_projects: list[RankingProjectItem] = Field(default_factory=list)
+    mapped_projects: list[RankingProjectItem] = Field(default_factory=list)
+    unmapped_projects: list[RankingProjectItem] = Field(default_factory=list)
+    excluded_projects: list[NonComparableProjectItem] = Field(default_factory=list)
+    generated_at: datetime
+
+
+def _validate_lon_lat_pair(pair: Any) -> list[float]:
+    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+        raise ValueError("Cada coordenada GeoJSON debe ser [longitud, latitud]")
+    lon, lat = pair[0], pair[1]
+    if isinstance(lon, bool) or isinstance(lat, bool) or not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+        raise ValueError("Longitud y latitud deben ser numericas")
+    lon_f, lat_f = float(lon), float(lat)
+    if not (math.isfinite(lon_f) and math.isfinite(lat_f)):
+        raise ValueError("Coordenadas GeoJSON no pueden ser NaN o infinito")
+    if not (-180.0 <= lon_f <= 180.0 and -90.0 <= lat_f <= 90.0):
+        raise ValueError("Coordenadas GeoJSON fuera de rango valido (lon [-180,180], lat [-90,90])")
+    return [lon_f, lat_f]
+
+
+def _validate_ring(ring: Any) -> tuple[list[list[float]], int]:
+    if not isinstance(ring, list) or len(ring) < 4:
+        raise ValueError("Cada anillo de poligono GeoJSON requiere al menos 4 vertices")
+    pts = [_validate_lon_lat_pair(pt) for pt in ring]
+    if pts[0] != pts[-1]:
+        raise ValueError("Cada anillo de poligono GeoJSON debe estar cerrado (primer y ultimo punto iguales)")
+    return pts, len(pts)
+
+
+def validate_and_sanitize_geojson(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        raise ValueError("geojson_data debe ser un objeto GeoJSON")
+    serialized = json.dumps(raw)
+    if len(serialized.encode("utf-8")) > 65536:
+        raise ValueError("El objeto GeoJSON excede el tamano maximo permitido (64 KB)")
+    gtype = raw.get("type")
+    if gtype not in ("Point", "LineString", "Polygon", "MultiPolygon"):
+        raise ValueError("Tipo GeoJSON no soportado; use Point, LineString, Polygon o MultiPolygon")
+    coords = raw.get("coordinates")
+    if coords is None:
+        raise ValueError("El objeto GeoJSON debe incluir 'coordinates'")
+
+    total_vertices = 0
+    if gtype == "Point":
+        clean_coords: Any = _validate_lon_lat_pair(coords)
+        total_vertices = 1
+    elif gtype == "LineString":
+        if not isinstance(coords, list) or len(coords) < 2:
+            raise ValueError("LineString requiere al menos 2 puntos")
+        clean_coords = [_validate_lon_lat_pair(pt) for pt in coords]
+        total_vertices = len(clean_coords)
+    elif gtype == "Polygon":
+        if not isinstance(coords, list) or len(coords) < 1:
+            raise ValueError("Polygon requiere al menos un anillo")
+        clean_rings = []
+        for ring in coords:
+            pts, cnt = _validate_ring(ring)
+            clean_rings.append(pts)
+            total_vertices += cnt
+        clean_coords = clean_rings
+    else:  # MultiPolygon
+        if not isinstance(coords, list) or len(coords) < 1:
+            raise ValueError("MultiPolygon requiere al menos un poligono")
+        clean_polys = []
+        for poly in coords:
+            if not isinstance(poly, list) or len(poly) < 1:
+                raise ValueError("Cada poligono de MultiPolygon requiere al menos un anillo")
+            clean_rings = []
+            for ring in poly:
+                pts, cnt = _validate_ring(ring)
+                clean_rings.append(pts)
+                total_vertices += cnt
+            clean_polys.append(clean_rings)
+        clean_coords = clean_polys
+
+    if total_vertices > 500:
+        raise ValueError("La geometria GeoJSON excede el limite de 500 vertices")
+    return gtype, {"type": gtype, "coordinates": clean_coords}
+
+
+class GeospatialLayerCreate(BaseModel):
+    """Registro de capa geoespacial versionada y con procedencia verificable (HU4.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+    layer_type: Literal["influence_area", "beneficiary_coverage", "territorial_zone"]
+    layer_name: str = Field(min_length=3, max_length=160)
+    meaning: str = Field(min_length=5, max_length=600)
+    source_name: str = Field(min_length=3, max_length=240)
+    data_origin: Literal[
+        "declared", "official_cadastre", "field_survey", "public", "simulated"
+    ] = "declared"
+    availability_status: Literal["available", "unavailable"] = "available"
+    geojson_data: dict[str, Any] | None = None
+    aggregate_beneficiaries_count: int | None = Field(default=None, ge=0)
+
+    @field_validator("layer_name", "meaning", "source_name", mode="before")
+    @classmethod
+    def strip_required_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @model_validator(mode="after")
+    def validate_geometry_by_availability(self) -> "GeospatialLayerCreate":
+        if self.availability_status == "unavailable":
+            self.geojson_data = None
+            return self
+        if self.geojson_data is None:
+            raise ValueError("Una capa disponible requiere geojson_data valido")
+        _, sanitized = validate_and_sanitize_geojson(self.geojson_data)
+        self.geojson_data = sanitized
+        return self
+
+
+class GeospatialLayerItem(BaseModel):
+    layer_id: UUID
+    project_version_id: UUID
+    layer_type: str
+    layer_type_label: str
+    layer_name: str
+    meaning: str
+    source_name: str
+    data_origin: str
+    availability_status: str
+    geometry_type: str | None = None
+    geojson_data: dict[str, Any] | None = None
+    aggregate_beneficiaries_count: int | None = None
+    created_at: datetime
+
+
+class ProjectGeospatialLayersResponse(BaseModel):
+    project_id: UUID
+    project_code: str
+    project_version_id: UUID
+    version_number: int
+    has_available_geometry: bool
+    layers: list[GeospatialLayerItem] = Field(default_factory=list)
+    empty_message: str | None = None
+    privacy_notice: str
+
+
+class CheckpointDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: Literal["approve_continue", "request_correction"]
+    justification: str = Field(min_length=5, max_length=2000)
+    conditions: str | None = Field(default=None, max_length=2000)
+
+
+class CheckpointDecisionResponse(BaseModel):
+    decision_id: UUID
+    checkpoint_id: UUID
+    project_id: UUID
+    project_version_id: UUID
+    version_number: int
+    decision: str
+    decision_label: str
+    justification: str
+    conditions: str | None = None
+    decided_by_user_id: UUID
+    decided_by_name: str | None = None
+    decided_by_email: str | None = None
+    decided_at: datetime
+    idempotency_key: str
+    integrity_hash_sha256: str
+    recomputed_hash_sha256: str
+    verification_status: Literal["valid", "failed"]
+    verification_label: str
+    prototype_notice: str
+    checkpoint_status: str
+    duplicated: bool = False
+
+
+class CheckpointDecisionsListResponse(BaseModel):
+    project_id: UUID
+    project_version_id: UUID
+    version_number: int
+    decisions: list[CheckpointDecisionResponse] = Field(default_factory=list)
+    prototype_notice: str
+
+
+class AuditProjectSummaryItem(BaseModel):
+    project_id: UUID
+    code: str
+    title: str
+    status: str
+    current_version_number: int
+    versions_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AuditProjectSummaryListResponse(BaseModel):
+    projects: list[AuditProjectSummaryItem] = Field(default_factory=list)
+
+
+class HistoryVersionSummaryItem(BaseModel):
+    project_version_id: UUID
+    version_number: int
+    title: str
+    estimated_budget_pen: Decimal
+    beneficiaries_count: int
+    created_by_user_id: UUID
+    created_by_name: str | None = None
+    created_at: datetime
+
+
+class HistoryTimelineEventItem(BaseModel):
+    event_id: str
+    event_type: str
+    category: str
+    title: str
+    source: str
+    occurred_at: datetime
+    project_version_id: UUID | None = None
+    version_number: int | None = None
+    actor_user_id: UUID | None = None
+    actor_name: str | None = None
+    actor_in_directory: bool | None = None
+    record_id: UUID | None = None
+    decision_kind: Literal["checkpoint_decision", "final_approval"] | None = None
+    decision_code: str | None = None
+    justification: str | None = None
+    conditions: str | None = None
+    checkpoint_id: UUID | None = None
+    checkpoint_status: str | None = None
+    has_integrity_hash: bool = False
+    result: str
+    detail: str
+    integrity_hash_sha256: str | None = None
+    verification_status: Literal["valid", "failed"] | None = None
+    verification_label: str | None = None
+    prototype_notice: str | None = None
+
+
+class DecisionIntegrityVerificationResponse(BaseModel):
+    project_id: UUID
+    project_code: str
+    project_title: str
+    project_version_id: UUID
+    version_number: int
+    decision_id: UUID
+    decision_kind: Literal["checkpoint_decision", "final_approval"]
+    checkpoint_id: UUID | None = None
+    checkpoint_status: str | None = None
+    decision: str
+    decision_label: str
+    justification: str
+    conditions: str | None = None
+    decided_by_user_id: UUID
+    decided_by_name: str | None = None
+    actor_in_directory: bool
+    decided_at: datetime
+    has_integrity_hash: bool
+    integrity_status: Literal["intact", "tampered", "unavailable"]
+    integrity_label: str
+    stored_hash_sha256: str | None = None
+    recomputed_hash_sha256: str | None = None
+    canonical_payload_matches: bool | None = None
+    checked_at: datetime
+    prototype_notice: str
+    read_only: bool = True
+
+
+class ProjectHistoryResponse(BaseModel):
+    project_id: UUID
+    code: str
+    current_title: str
+    current_status: str
+    current_version_id: UUID
+    current_version_number: int
+    versions: list[HistoryVersionSummaryItem] = Field(default_factory=list)
+    events: list[HistoryTimelineEventItem] = Field(default_factory=list)
+    historical_limitations: list[str] = Field(default_factory=list)
+    read_only: bool = True
     generated_at: datetime
 
 

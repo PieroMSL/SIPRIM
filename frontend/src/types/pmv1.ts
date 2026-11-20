@@ -54,6 +54,44 @@ export interface CheckpointResumeResponse {
   message: string
 }
 
+export interface CheckpointDecisionRequest {
+  decision: 'approve_continue' | 'request_correction'
+  justification: string
+  conditions?: string | null
+}
+
+export interface CheckpointDecisionResponse {
+  decision_id: string
+  checkpoint_id: string
+  project_id: string
+  project_version_id: string
+  version_number: number
+  decision: 'approve_continue' | 'request_correction' | string
+  decision_label: string
+  justification: string
+  conditions?: string | null
+  decided_by_user_id: string
+  decided_by_name?: string | null
+  decided_by_email?: string | null
+  decided_at: string
+  idempotency_key: string
+  integrity_hash_sha256: string
+  recomputed_hash_sha256: string
+  verification_status: 'valid' | 'failed'
+  verification_label: string
+  prototype_notice: string
+  checkpoint_status: string
+  duplicated: boolean
+}
+
+export interface CheckpointDecisionsListResponse {
+  project_id: string
+  project_version_id: string
+  version_number: number
+  decisions: CheckpointDecisionResponse[]
+  prototype_notice: string
+}
+
 export interface PMV1ProjectCreate {
   code?: string
   title?: string

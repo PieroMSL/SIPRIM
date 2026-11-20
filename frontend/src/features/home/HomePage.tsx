@@ -2,10 +2,14 @@ import { Link } from 'react-router-dom'
 import { useMemo } from 'react'
 import { ProyectoCard } from '../../components/proyecto/ProyectoCard'
 import { RoadmapPanel } from '../../components/roadmap/RoadmapPanel'
+import { useAuth } from '../auth/AuthContext'
 import { loadRecentProjects } from '../../utils/recentProjects'
 
 export function HomePage() {
+  const { hasRole } = useAuth()
   const recientes = useMemo(() => loadRecentProjects(), [])
+  const canRegister = hasRole('PLANNER') || hasRole('ADMIN')
+  const canViewRanking = hasRole('MAYOR') || hasRole('ADMIN') || hasRole('PLANNER')
 
   return (
     <div className="home-layout">
@@ -19,9 +23,17 @@ export function HomePage() {
           municipal.
         </p>
         <div className="hero-actions">
-          <Link to="/registrar" className="btn btn-primary">
-            Cargar expediente
-          </Link>
+          {canRegister ? (
+            <Link to="/registrar" className="btn btn-primary">
+              Cargar expediente
+            </Link>
+          ) : (
+            canViewRanking && (
+              <Link to="/ranking-mapa" className="btn btn-primary">
+                Ranking y Mapa
+              </Link>
+            )
+          )}
           <Link to="/consultar" className="btn btn-secondary">
             Consultar por UUID
           </Link>

@@ -1,5 +1,5 @@
 import type { ApiErrorBody } from '../types/proyecto'
-import { clearAccessToken, loadAccessToken } from './authStorage'
+import { clearAccessToken, loadAccessToken, notifySessionExpired } from './authStorage'
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.PROD ? '' : 'http://127.0.0.1:8000')
 
@@ -51,6 +51,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
   if (auth) {
     const token = loadAccessToken()
     if (!token) {
+      notifySessionExpired('Sesión expirada. Vuelva a iniciar sesión.')
       throw new Error('Sesión expirada. Vuelva a iniciar sesión.')
     }
     mergedHeaders.set('Authorization', `Bearer ${token}`)
@@ -89,6 +90,9 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 
   if (res.status === 401) {
     clearAccessToken()
+    if (auth || path !== '/api/v1/auth/login') {
+      notifySessionExpired('Sesión expirada. Vuelva a iniciar sesión.')
+    }
   }
 
   if (!res.ok) {

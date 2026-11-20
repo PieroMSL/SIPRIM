@@ -37,11 +37,16 @@ CREATE TABLE IF NOT EXISTS project_versions (
     proposed_land_use VARCHAR(150),
     territorial_data_origin VARCHAR(16) NOT NULL DEFAULT 'declared'
         CHECK (territorial_data_origin IN ('declared','simulated','public')),
+    latitude NUMERIC(9,6) CHECK (latitude IS NULL OR (latitude >= -90 AND latitude <= 90)),
+    longitude NUMERIC(9,6) CHECK (longitude IS NULL OR (longitude >= -180 AND longitude <= 180)),
+    coordinates_origin VARCHAR(24) CHECK (coordinates_origin IS NULL OR coordinates_origin IN ('declared','official_cadastre','field_survey','public','simulated')),
+    coordinates_source VARCHAR(240),
     estimated_budget_pen NUMERIC(18,2) NOT NULL CHECK (estimated_budget_pen > 0),
     beneficiaries_count INTEGER NOT NULL CHECK (beneficiaries_count > 0),
     created_by_user_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (project_id, version_number)
+    UNIQUE (project_id, version_number),
+    CONSTRAINT project_versions_coordinates_pair_check CHECK ((latitude IS NULL AND longitude IS NULL) OR (latitude IS NOT NULL AND longitude IS NOT NULL))
 );
 
 DO $$
@@ -650,3 +655,59 @@ CREATE TABLE IF NOT EXISTS technical_feasibility_assessments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tech_assess_proj_ver ON technical_feasibility_assessments(project_id, project_version_id, evaluated_at DESC);
+-- PMV 3 - HU4.2: Capas geoespaciales versionadas
+CREATE TABLE IF NOT EXISTS project_geospatial_layers (
+    id UUID PRIMARY KEY,
+    project_version_id UUID NOT NULL REFERENCES project_versions(id) ON DELETE RESTRICT,
+    layer_type VARCHAR(40) NOT NULL
+        CHECK (layer_type IN ('influence_area', 'beneficiary_coverage', 'territorial_zone')),
+    layer_name VARCHAR(160) NOT NULL,
+    meaning TEXT NOT NULL,
+    source_name VARCHAR(240) NOT NULL,
+    data_origin VARCHAR(24) NOT NULL DEFAULT 'declared'
+        CHECK (data_origin IN ('declared', 'official_cadastre', 'field_survey', 'public', 'simulated')),
+    availability_status VARCHAR(24) NOT NULL DEFAULT 'available'
+        CHECK (availability_status IN ('available', 'unavailable')),
+    geometry_type VARCHAR(24)
+        CHECK (geometry_type IS NULL OR geometry_type IN ('Point', 'LineString', 'Polygon', 'MultiPolygon')),
+    geojson_data JSONB,
+    aggregate_beneficiaries_count INTEGER
+        CHECK (aggregate_beneficiaries_count IS NULL OR aggregate_beneficiaries_count >= 0),
+    created_by_user_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT geospatial_layer_availability_check CHECK (
+        (availability_status = 'unavailable' AND geojson_data IS NULL)
+        OR (availability_status = 'available' AND geojson_data IS NOT NULL AND geometry_type IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_geo_layers_version
+    ON project_geospatial_layers(project_version_id, layer_type);
+
+-- HU3.3 · Registro persistente de decisiones de revision en checkpoints con huella SHA-256
+CREATE TABLE IF NOT EXISTS checkpoint_review_decisions (
+    id UUID PRIMARY KEY,
+    checkpoint_id UUID NOT NULL REFERENCES evaluation_checkpoints(id) ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    project_version_id UUID NOT NULL REFERENCES project_versions(id) ON DELETE CASCADE,
+    decision VARCHAR(32) NOT NULL
+        CHECK (decision IN ('approve_continue', 'request_correction')),
+    justification TEXT NOT NULL,
+    conditions TEXT,
+    decided_by_user_id UUID NOT NULL,
+    decided_by_name VARCHAR(160),
+    decided_by_email VARCHAR(254),
+    decided_at TIMESTAMPTZ NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL UNIQUE,
+    canonical_payload JSONB NOT NULL,
+    integrity_hash_sha256 CHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cp_decisions_checkpoint
+    ON checkpoint_review_decisions(checkpoint_id, decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cp_decisions_version
+    ON checkpoint_review_decisions(project_version_id, decided_at DESC);
+
+ALTER TABLE evaluation_checkpoints
+    ADD COLUMN IF NOT EXISTS decision_id UUID REFERENCES checkpoint_review_decisions(id) ON DELETE SET NULL;

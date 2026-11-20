@@ -3,12 +3,19 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from 'react'
+import { getCurrentSessionMe } from '../../api/adminAuth.api'
 import { loginApi } from '../../api/auth.api'
-import { clearAccessToken, saveAccessToken } from '../../api/authStorage'
+import {
+  clearAccessToken,
+  hasUsableAccessToken,
+  saveAccessToken,
+  subscribeSessionExpired,
+} from '../../api/authStorage'
 import type { AuthSession, AuthUser, LoginCredentials } from '../../types/auth'
 import { roleGrantsAccess } from '../../utils/roles'
 import { clearAuthSession, loadAuthSession, saveAuthSession } from './authStorage'
@@ -16,6 +23,11 @@ import { clearAuthSession, loadAuthSession, saveAuthSession } from './authStorag
 interface AuthContextValue {
   user: AuthUser | null
   isAuthenticated: boolean
+  authNotice: string | null
+  roleUpdateNotice: string | null
+  clearAuthNotice: () => void
+  clearRoleUpdateNotice: () => void
+  refreshSessionRoles: () => Promise<void>
   hasRole: (role: string) => boolean
   login: (credentials: LoginCredentials) => Promise<string | null>
   logout: () => void
@@ -23,10 +35,92 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
+function readInitialAuthState(): { session: AuthSession | null; notice: string | null } {
+  const storedSession = loadAuthSession()
+  if (!storedSession) {
+    if (!hasUsableAccessToken()) {
+      clearAccessToken()
+    }
+    return { session: null, notice: null }
+  }
+  if (!hasUsableAccessToken()) {
+    clearAuthSession()
+    return {
+      session: null,
+      notice: 'Su sesión ha caducado o ya no es válida. Vuelva a iniciar sesión.',
+    }
+  }
+  return { session: storedSession, notice: null }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [session, setSession] = useState<AuthSession | null>(() => loadAuthSession())
+  const [initialState] = useState(() => readInitialAuthState())
+  const [session, setSession] = useState<AuthSession | null>(initialState.session)
+  const [authNotice, setAuthNotice] = useState<string | null>(initialState.notice)
+  const [roleUpdateNotice, setRoleUpdateNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    return subscribeSessionExpired((message) => {
+      clearAuthSession()
+      setSession(null)
+      setRoleUpdateNotice(null)
+      setAuthNotice(message)
+    })
+  }, [])
+
+  const clearAuthNotice = useCallback(() => {
+    setAuthNotice(null)
+  }, [])
+
+  const clearRoleUpdateNotice = useCallback(() => {
+    setRoleUpdateNotice(null)
+  }, [])
+
+  const refreshSessionRoles = useCallback(async () => {
+    if (!hasUsableAccessToken()) return
+    try {
+      const me = await getCurrentSessionMe()
+      setSession((prev) => {
+        if (!prev) return prev
+        const prevSorted = [...prev.user.roles].sort().join(',')
+        const nextSorted = [...me.roles].sort().join(',')
+        if (prevSorted === nextSorted) return prev
+        const updated: AuthSession = {
+          ...prev,
+          user: { ...prev.user, roles: me.roles },
+        }
+        saveAuthSession(updated)
+        setRoleUpdateNotice(
+          me.roles.length
+            ? `Sus permisos vigentes fueron actualizados por la administración: ${me.roles.join(', ')}.`
+            : 'Sus roles fueron revocados por la administración. Algunas funciones ya no están disponibles.',
+        )
+        return updated
+      })
+    } catch {
+      /* 401 es manejado por apiFetch/subscribeSessionExpired */
+    }
+  }, [])
+
+  const currentUserId = session?.user.id ?? null
+
+  useEffect(() => {
+    if (!currentUserId) return
+    const timer = window.setTimeout(() => {
+      void refreshSessionRoles()
+    }, 0)
+    const onFocus = () => {
+      void refreshSessionRoles()
+    }
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [currentUserId, refreshSessionRoles])
 
   const login = useCallback(async (credentials: LoginCredentials) => {
+    setAuthNotice(null)
     try {
       const response = await loginApi(credentials)
       saveAccessToken(response.access_token)
@@ -46,6 +140,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(next)
       return null
     } catch (err) {
+      clearAuthSession()
+      setSession(null)
       const message = err instanceof Error ? err.message : 'No se pudo iniciar sesión.'
       if (message.toLowerCase().includes('credenciales') || message.includes('401')) {
         return 'Correo o contraseña incorrectos. Use las credenciales asignadas por la municipalidad.'
@@ -67,6 +163,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearAccessToken()
     clearAuthSession()
     setSession(null)
+    setAuthNotice(null)
   }, [])
 
   const hasRole = useCallback(
@@ -80,12 +177,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AuthContextValue>(
     () => ({
       user: session?.user ?? null,
-      isAuthenticated: session !== null,
+      isAuthenticated: session !== null && hasUsableAccessToken(),
+      authNotice,
+      roleUpdateNotice,
+      clearAuthNotice,
+      clearRoleUpdateNotice,
+      refreshSessionRoles,
       hasRole,
       login,
       logout,
     }),
-    [session, hasRole, login, logout],
+    [
+      session,
+      authNotice,
+      roleUpdateNotice,
+      clearAuthNotice,
+      clearRoleUpdateNotice,
+      refreshSessionRoles,
+      hasRole,
+      login,
+      logout,
+    ],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

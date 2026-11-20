@@ -90,7 +90,17 @@ def test_hu3_4_ca01_valid_resume_continues_and_preserves_results(service):
         assert cp_before["status"] == "pending_review"
         assert cp_before["allows_final_approval"] is False
 
-        # 2. Planificador/Gerente autorizado reanuda formalmente
+        # 2. Planificador/Gerente autorizado registra constancia HU3.3 y reanuda formalmente
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Se aprueba continuar tras verificación de muro de gaviones y expediente de contención fluvial.",
+            conditions="Verificar periódicamente el nivel de socavación en ribera.",
+            idempotency_key=f"dec-{uuid4()}",
+        )
         resume_key = f"resume-test-{uuid4()}"
         res = service.resume_project_checkpoint(
             project_id=proj_id,
@@ -257,7 +267,17 @@ def test_hu3_4_ca03_new_version_does_not_reuse_previous_approval(service):
                 (uuid4(), proj_id, v1_id),
             )
 
-        # Reanudar versión 1
+        # Reanudar versión 1 (previa constancia HU3.3)
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Reanudación aprobada para versión 1",
+            conditions=None,
+            idempotency_key=f"dec-v1-{uuid4()}",
+        )
         service.resume_project_checkpoint(
             project_id=proj_id,
             actor_id=PLANNER_ID,
@@ -335,6 +355,16 @@ def test_hu3_4_idempotent_retry_and_mismatch_protection(service):
                 (uuid4(), proj_id, v1_id),
             )
 
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Justificación original primera vez",
+            conditions="Condición A",
+            idempotency_key=f"dec-idem-{uuid4()}",
+        )
         key = f"key-cp-{uuid4()}"
         res1 = service.resume_project_checkpoint(
             project_id=proj_id,
@@ -413,7 +443,17 @@ def test_hu3_4_resuming_does_not_equal_final_human_approval(service):
                 (uuid4(), proj_id, v1_id),
             )
 
-        # Reanudar desde el checkpoint
+        # Reanudar desde el checkpoint (previa constancia HU3.3)
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Levantamiento de pausa para continuar análisis",
+            conditions=None,
+            idempotency_key=f"dec-not-final-{uuid4()}",
+        )
         service.resume_project_checkpoint(
             project_id=proj_id,
             actor_id=PLANNER_ID,
@@ -509,7 +549,17 @@ def test_hu3_4_already_resolved_checkpoint_rejected_for_new_request(service):
                 (uuid4(), proj_id, v1_id),
             )
 
-        # 1. Primera reanudación exitosa
+        # 1. Primera reanudación exitosa (previa constancia HU3.3)
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Primera reanudación válida autorizada",
+            conditions=None,
+            idempotency_key=f"dec-first-{uuid4()}",
+        )
         service.resume_project_checkpoint(
             project_id=proj_id,
             actor_id=PLANNER_ID,
@@ -627,7 +677,17 @@ def test_hu3_4_resume_executes_pending_economic_stage_and_creates_projection(ser
         assert eval_before["status"] == "pending_review"
         assert eval_before["result"] is None
 
-        # 2. Reanudar el punto de control formalmente
+        # 2. Reanudar el punto de control formalmente (previa constancia HU3.3)
+        service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Planeamiento",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Se aprueba continuar tras verificación de estudios de socavación y defensas ribereñas.",
+            conditions="Inspección semestral de defensas ribereñas.",
+            idempotency_key=f"dec-real-{uuid4()}",
+        )
         resume_res = service.resume_project_checkpoint(
             project_id=proj_id,
             actor_id=PLANNER_ID,

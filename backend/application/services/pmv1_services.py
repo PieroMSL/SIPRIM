@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import socket
 import hashlib
+import hmac
+import json
 import math
 import re
 import secrets
@@ -20,6 +22,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend.application.dto.pmv1_dto import PMV1ProjectCreate, PertEstimateCreate
+from backend.application.services.prioritization_pdf_service import build_prioritization_pdf
 from backend.infrastructure.config.settings import get_settings
 from backend.domain.exceptions.pmv1_exceptions import (
     AccesoDenegadoError,
@@ -114,6 +117,48 @@ def _load_fallback_seed_documents() -> list[dict[str, Any]]:
         return []
 
 
+HU33_PROTOTYPE_NOTICE = (
+    "Constancia de integridad SHA-256 del prototipo académico SIPRIM: "
+    "detecta alteraciones del contenido respecto a la huella almacenada, "
+    "pero no constituye firma digital certificada con validez jurídica."
+)
+
+
+def _compute_checkpoint_decision_sha256(
+    *,
+    decision_id: UUID,
+    checkpoint_id: UUID,
+    project_id: UUID,
+    project_version_id: UUID,
+    decision: str,
+    justification: str,
+    conditions: str | None,
+    decided_by_user_id: UUID,
+    decided_by_name: str | None,
+    decided_by_email: str | None,
+    decided_at: datetime,
+) -> tuple[dict[str, Any], str]:
+    """Calcula la representacion canonica y el resumen SHA-256 de una decision HITL (HU3.3)."""
+    dt_utc = decided_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    canonical = {
+        "schema_version": "hu3.3-v2",
+        "decision_id": str(decision_id),
+        "checkpoint_id": str(checkpoint_id),
+        "project_id": str(project_id),
+        "project_version_id": str(project_version_id),
+        "decision": decision,
+        "justification": justification,
+        "conditions": conditions or "",
+        "decided_by_user_id": str(decided_by_user_id),
+        "decided_by_name": decided_by_name or "",
+        "decided_by_email": decided_by_email or "",
+        "decided_at_utc": dt_utc,
+    }
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return canonical, digest
+
+
 class AuthService:
     def __init__(
         self,
@@ -129,6 +174,8 @@ class AuthService:
         self.audience = audience
         self.expiration_minutes = expiration_minutes
         self.password_hasher = PasswordHasher()
+        # Hash ficticio para igualar el costo Argon2 cuando el usuario no existe o está inactivo.
+        self._dummy_password_hash = self.password_hasher.hash("siprim-dummy-timing-equalizer")
 
     def issue_token(
         self,
@@ -175,6 +222,10 @@ class AuthService:
                     (clean_email,),
                 ).fetchone()
             if not row or not row["is_active"]:
+                try:
+                    self.password_hasher.verify(self._dummy_password_hash, password)
+                except (VerifyMismatchError, InvalidHashError):
+                    pass
                 raise CredencialesInvalidasError("Credenciales invalidas")
             try:
                 self.password_hasher.verify(row["password_hash"], password)
@@ -197,6 +248,236 @@ class AuthService:
             )
         except jwt.PyJWTError as exc:
             raise CredencialesInvalidasError("Token invalido o expirado") from exc
+
+    def get_active_user_roles(self, user_id: UUID) -> list[str]:
+        """Consulta los roles vigentes y estado activo de la cuenta en auth_db (HU5.1)."""
+        try:
+            if not _is_db_available(self.db_url):
+                raise psycopg.OperationalError("Base de datos de autenticacion no disponible")
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                row = conn.execute(
+                    """
+                    SELECT u.is_active,
+                           COALESCE(
+                               array_agg(r.code ORDER BY r.code) FILTER (WHERE r.code IS NOT NULL),
+                               '{}'
+                           ) AS roles
+                    FROM users u
+                    LEFT JOIN user_roles ur ON ur.user_id = u.id
+                    LEFT JOIN roles r ON r.id = ur.role_id
+                    WHERE u.id = %s
+                    GROUP BY u.id
+                    """,
+                    (user_id,),
+                ).fetchone()
+            if not row or not row["is_active"]:
+                raise CredencialesInvalidasError("Usuario inactivo o no autorizado")
+            return list(row["roles"])
+        except psycopg.OperationalError as err:
+            raise ServicioNoDisponibleError(
+                "Servicio de autenticacion no disponible para validar permisos vigentes."
+            ) from err
+
+    def get_current_user_profile(self, user_id: UUID) -> dict[str, Any]:
+        """Devuelve identidad y roles vigentes del usuario autenticado desde auth_db."""
+        try:
+            if not _is_db_available(self.db_url):
+                raise psycopg.OperationalError("Base de datos de autenticacion no disponible")
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                row = conn.execute(
+                    """
+                    SELECT u.id, u.email, u.full_name, u.is_active,
+                           COALESCE(
+                               array_agg(r.code ORDER BY r.code) FILTER (WHERE r.code IS NOT NULL),
+                               '{}'
+                           ) AS roles
+                    FROM users u
+                    LEFT JOIN user_roles ur ON ur.user_id = u.id
+                    LEFT JOIN roles r ON r.id = ur.role_id
+                    WHERE u.id = %s
+                    GROUP BY u.id
+                    """,
+                    (user_id,),
+                ).fetchone()
+            if not row or not row["is_active"]:
+                raise CredencialesInvalidasError("Usuario inactivo o no autorizado")
+            return {
+                "user_id": row["id"],
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "is_active": bool(row["is_active"]),
+                "roles": list(row["roles"]),
+            }
+        except psycopg.OperationalError as err:
+            raise ServicioNoDisponibleError(
+                "Servicio de autenticacion no disponible: la base de datos no responde."
+            ) from err
+
+    def list_users_and_roles(self) -> dict[str, Any]:
+        """Lista usuarios municipales (sin hashes ni secretos) y catalogo de roles (HU5.1)."""
+        try:
+            if not _is_db_available(self.db_url):
+                raise psycopg.OperationalError("Base de datos de autenticacion no disponible")
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                role_rows = conn.execute(
+                    "SELECT code, name FROM roles ORDER BY code ASC"
+                ).fetchall()
+                user_rows = conn.execute(
+                    """
+                    SELECT u.id, u.email, u.full_name, u.is_active, u.created_at, u.updated_at,
+                           COALESCE(
+                               array_agg(r.code ORDER BY r.code) FILTER (WHERE r.code IS NOT NULL),
+                               '{}'
+                           ) AS roles
+                    FROM users u
+                    LEFT JOIN user_roles ur ON ur.user_id = u.id
+                    LEFT JOIN roles r ON r.id = ur.role_id
+                    GROUP BY u.id
+                    ORDER BY u.created_at ASC, u.email ASC
+                    """
+                ).fetchall()
+            available_roles = [
+                {
+                    "code": r["code"],
+                    "name": r["name"],
+                    "privileged": r["code"] == "SUPERADMIN",
+                }
+                for r in role_rows
+            ]
+            users = [
+                {
+                    "id": u["id"],
+                    "email": u["email"],
+                    "full_name": u["full_name"],
+                    "is_active": bool(u["is_active"]),
+                    "roles": list(u["roles"]),
+                    "created_at": u["created_at"],
+                    "updated_at": u["updated_at"],
+                }
+                for u in user_rows
+            ]
+            return {"users": users, "available_roles": available_roles}
+        except psycopg.OperationalError as err:
+            raise ServicioNoDisponibleError(
+                "Servicio de autenticacion no disponible: la base de datos no responde."
+            ) from err
+
+    def update_user_roles(
+        self,
+        target_user_id: UUID,
+        new_roles: list[str],
+        actor_roles: list[str],
+    ) -> dict[str, Any]:
+        """Actualiza transaccionalmente los roles de un usuario municipal en auth_db (HU5.1)."""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in new_roles:
+            code = raw.strip().upper()
+            if not code:
+                raise ConfiguracionPMV1Error("El codigo de rol no puede estar vacio.")
+            if code in seen:
+                raise ConfiguracionPMV1Error(f"Rol duplicado en la solicitud: {code}")
+            seen.add(code)
+            normalized.append(code)
+
+        try:
+            if not _is_db_available(self.db_url):
+                raise psycopg.OperationalError("Base de datos de autenticacion no disponible")
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                with conn.transaction():
+                    # Serializa cambios de rol para garantizar atomicidad en la regla del ultimo administrador activo.
+                    conn.execute("SELECT pg_advisory_xact_lock(hashtext('siprim_admin_role_guard'))")
+                    user_row = conn.execute(
+                        """
+                        SELECT id, email, full_name, is_active, created_at, updated_at
+                        FROM users
+                        WHERE id = %s
+                        FOR UPDATE
+                        """,
+                        (target_user_id,),
+                    ).fetchone()
+                    if not user_row:
+                        raise RecursoPMV1NoEncontradoError("Usuario municipal no encontrado.")
+
+                    current_rows = conn.execute(
+                        """
+                        SELECT r.code
+                        FROM user_roles ur
+                        JOIN roles r ON r.id = ur.role_id
+                        WHERE ur.user_id = %s
+                        """,
+                        (target_user_id,),
+                    ).fetchall()
+                    current_roles = [r["code"] for r in current_rows]
+
+                    catalog_rows = conn.execute("SELECT id, code FROM roles").fetchall()
+                    role_id_by_code = {r["code"]: r["id"] for r in catalog_rows}
+                    invalid_codes = [c for c in normalized if c not in role_id_by_code]
+                    if invalid_codes:
+                        raise ConfiguracionPMV1Error(
+                            f"Rol invalido no registrado en el catalogo: {', '.join(invalid_codes)}"
+                        )
+
+                    actor_is_superadmin = "SUPERADMIN" in actor_roles
+                    if not actor_is_superadmin and (
+                        "SUPERADMIN" in normalized or "SUPERADMIN" in current_roles
+                    ):
+                        raise AccesoDenegadoError(
+                            "Solo una cuenta SUPERADMIN puede asignar o modificar el rol SUPERADMIN."
+                        )
+
+                    if not user_row["is_active"] and normalized:
+                        raise ConfiguracionPMV1Error(
+                            "No se pueden asignar roles a una cuenta municipal inactiva."
+                        )
+
+                    had_admin = ("ADMIN" in current_roles) or ("SUPERADMIN" in current_roles)
+                    will_have_admin = ("ADMIN" in normalized) or ("SUPERADMIN" in normalized)
+                    if had_admin and not will_have_admin:
+                        other_admins = conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT u.id) AS cnt
+                            FROM users u
+                            JOIN user_roles ur ON ur.user_id = u.id
+                            JOIN roles r ON r.id = ur.role_id
+                            WHERE u.is_active = TRUE
+                              AND u.id <> %s
+                              AND r.code IN ('ADMIN', 'SUPERADMIN')
+                            """,
+                            (target_user_id,),
+                        ).fetchone()
+                        if not other_admins or int(other_admins["cnt"]) == 0:
+                            raise ConfiguracionPMV1Error(
+                                "No se puede retirar el rol al ultimo administrador activo del sistema."
+                            )
+
+                    conn.execute("DELETE FROM user_roles WHERE user_id = %s", (target_user_id,))
+                    for code in normalized:
+                        conn.execute(
+                            "INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s)",
+                            (target_user_id, role_id_by_code[code]),
+                        )
+                    updated_row = conn.execute(
+                        "UPDATE users SET updated_at = now() WHERE id = %s RETURNING updated_at",
+                        (target_user_id,),
+                    ).fetchone()
+
+            return {
+                "user": {
+                    "id": user_row["id"],
+                    "email": user_row["email"],
+                    "full_name": user_row["full_name"],
+                    "is_active": bool(user_row["is_active"]),
+                    "roles": sorted(normalized),
+                    "created_at": user_row["created_at"],
+                    "updated_at": updated_row["updated_at"] if updated_row else user_row["updated_at"],
+                },
+                "message": "Roles actualizados correctamente.",
+            }
+        except psycopg.OperationalError as err:
+            raise ServicioNoDisponibleError(
+                "Servicio de autenticacion no disponible: la base de datos no responde."
+            ) from err
 
 
 
@@ -1670,12 +1951,14 @@ class PlatformService:
     def __init__(
         self,
         db_url: str,
-        dispatcher: TaskDispatcher,
+        dispatcher: TaskDispatcher | None = None,
         enable_demo_fallback: bool = False,
+        auth_db_url: str | None = None,
     ) -> None:
         self.db_url = _dsn(db_url)
         self.dispatcher = dispatcher
         self.enable_demo_fallback = enable_demo_fallback
+        self.auth_db_url = _dsn(auth_db_url) if auth_db_url else None
 
     @staticmethod
     def _missing(data: PMV1ProjectCreate) -> list[str]:
@@ -1710,8 +1993,9 @@ class PlatformService:
                     INSERT INTO project_versions
                     (id, project_id, version_number, title, description,
                      location_description, proposed_land_use, territorial_data_origin,
+                     latitude, longitude, coordinates_origin, coordinates_source,
                      estimated_budget_pen, beneficiaries_count, created_by_user_id)
-                    VALUES (%s,%s,1,%s,%s,%s,%s,'declared',%s,%s,%s)
+                    VALUES (%s,%s,1,%s,%s,%s,%s,'declared',%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         version_id,
@@ -1720,6 +2004,10 @@ class PlatformService:
                         data.description,
                         data.location,
                         data.proposed_land_use,
+                        data.latitude,
+                        data.longitude,
+                        data.coordinates_origin if data.latitude is not None else None,
+                        data.coordinates_source if data.latitude is not None else None,
                         data.estimated_budget_pen,
                         data.beneficiaries_count,
                         actor_id,
@@ -1748,6 +2036,10 @@ class PlatformService:
         beneficiaries_count: int,
         actor_id: UUID,
         territorial_data_origin: str = "declared",
+        latitude: float | None = None,
+        longitude: float | None = None,
+        coordinates_origin: str | None = None,
+        coordinates_source: str | None = None,
     ) -> dict[str, Any]:
         """Crea una nueva versión de un proyecto (ej. v2 replanteada/mitigada) y actualiza el estado almacenado a 'ready' (operación de escritura)."""
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
@@ -1771,8 +2063,9 @@ class PlatformService:
                 INSERT INTO project_versions
                 (id, project_id, version_number, title, description,
                  location_description, proposed_land_use, territorial_data_origin,
+                 latitude, longitude, coordinates_origin, coordinates_source,
                  estimated_budget_pen, beneficiaries_count, created_by_user_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     version_id,
@@ -1783,6 +2076,10 @@ class PlatformService:
                     location_description,
                     proposed_land_use,
                     territorial_data_origin,
+                    latitude,
+                    longitude,
+                    coordinates_origin if latitude is not None else None,
+                    coordinates_source if latitude is not None else None,
                     estimated_budget_pen,
                     beneficiaries_count,
                     actor_id,
@@ -1816,6 +2113,7 @@ class PlatformService:
                        pv.version_number, p.status, pv.title, pv.description,
                        pv.location_description AS location, pv.proposed_land_use,
                        pv.territorial_data_origin,
+                       pv.latitude, pv.longitude, pv.coordinates_origin, pv.coordinates_source,
                        pv.estimated_budget_pen, pv.beneficiaries_count
                 FROM projects p JOIN project_versions pv ON pv.project_id = p.id
                 WHERE p.id=%s ORDER BY pv.version_number DESC LIMIT 1
@@ -1827,6 +2125,10 @@ class PlatformService:
             checkpoint = RiskCheckpointEngine.get_active_checkpoint(conn, row["project_version_id"])
             pert_estimate = self._get_pert_estimate_with_conn(conn, row["project_version_id"])
             res = dict(row)
+            if res.get("latitude") is not None:
+                res["latitude"] = float(res["latitude"])
+            if res.get("longitude") is not None:
+                res["longitude"] = float(res["longitude"])
 
             # HU3.2 (Estrictamente de lectura): Determinar el estado efectivo para la versión vigente del expediente.
             # No ejecuta sentencias UPDATE en projects ni muta evaluaciones, checkpoints, auditoría ni fechas.
@@ -2342,8 +2644,8 @@ class PlatformService:
 
     def _verify_planner_actor(self, actor_id: UUID) -> None:
         """Verifica que el usuario tenga rol de Gerente/Planificador (PLANNER) o Administrador (ADMIN) en auth_db (HU3.4)."""
-        settings = get_settings()
-        auth_dsn = _dsn(settings.auth_db_url)
+        raw_auth = self.auth_db_url or os.getenv("AUTH_DB_URL") or get_settings().auth_db_url
+        auth_dsn = _dsn(raw_auth)
         with psycopg.connect(auth_dsn, row_factory=dict_row) as conn:
             rows = conn.execute(
                 """
@@ -2351,15 +2653,15 @@ class PlatformService:
                 FROM users u
                 JOIN user_roles ur ON u.id = ur.user_id
                 JOIN roles r ON ur.role_id = r.id
-                WHERE u.id = %s
+                WHERE u.id = %s AND u.is_active = TRUE
                 """,
                 (actor_id,),
             ).fetchall()
             roles = {r["code"] for r in rows}
-            if not (roles & {"PLANNER", "ADMIN", "SUPERADMIN"}):
+            if not (roles & {"PLANNER", "PLANNING_MANAGER", "ADMIN", "SUPERADMIN"}):
                 raise AccesoDenegadoError(
                     f"El usuario {actor_id} no cuenta con perfil de Gerente de Planeamiento o Administrador. "
-                    "Se requiere rol PLANNER o ADMIN para autorizar la reanudación del checkpoint."
+                    "Se requiere rol PLANNING_MANAGER, PLANNER o ADMIN para autorizar la reanudación del checkpoint."
                 )
 
     def resume_project_checkpoint(
@@ -2462,7 +2764,55 @@ class PlatformService:
             checkpoint_id = cp_row["checkpoint_id"]
             evaluation_id = cp_row["evaluation_id"]
 
-            # 3. Actualizar checkpoint a resolved
+            # HU3.3: Evaluar la ULTIMA decision registrada para este checkpoint, proyecto y version (orden determinista)
+            latest_dec = conn.execute(
+                """
+                SELECT *
+                FROM checkpoint_review_decisions
+                WHERE checkpoint_id = %s
+                  AND project_id = %s
+                  AND project_version_id = %s
+                ORDER BY decided_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (checkpoint_id, project_id, version_id),
+            ).fetchone()
+
+            if not latest_dec:
+                raise ConfiguracionPMV1Error(
+                    "Debe registrar previamente una aprobación de continuación firmada (HU3.3) "
+                    "para este punto de control y versión antes de reanudar la evaluación."
+                )
+
+            if (
+                latest_dec["checkpoint_id"] != checkpoint_id
+                or latest_dec["project_id"] != project_id
+                or latest_dec["project_version_id"] != version_id
+            ):
+                raise ConfiguracionPMV1Error(
+                    "La constancia de decisión no corresponde al punto de control, proyecto o versión vigente."
+                )
+
+            if latest_dec["decision"] != "approve_continue":
+                raise ConfiguracionPMV1Error(
+                    "La última decisión registrada para este punto de control solicita corrección; "
+                    "la pausa permanece activa hasta registrar una nueva aprobación de continuación."
+                )
+
+            verified_dec = self._serialize_checkpoint_decision_row(
+                latest_dec,
+                version_number=int(project.get("version_number") or 1),
+                checkpoint_status=cp_row["status"],
+            )
+            if verified_dec["verification_status"] != "valid":
+                raise ConfiguracionPMV1Error(
+                    "La constancia de aprobación más reciente falló la verificación de integridad SHA-256; "
+                    "no se autoriza la reanudación."
+                )
+
+            linked_decision_id = latest_dec["id"]
+
+            # 3. Actualizar checkpoint a resolved vinculando decision_id
             conn.execute(
                 """
                 UPDATE evaluation_checkpoints
@@ -2472,6 +2822,7 @@ class PlatformService:
                     resolution_conditions = %s,
                     resolved_at = %s,
                     idempotency_key = %s,
+                    decision_id = %s,
                     updated_at = %s
                 WHERE id = %s AND status = 'pending_review'
                 """,
@@ -2481,6 +2832,7 @@ class PlatformService:
                     cleaned_conditions,
                     now,
                     cleaned_key,
+                    linked_decision_id,
                     now,
                     checkpoint_id,
                 ),
@@ -2635,6 +2987,1158 @@ class PlatformService:
             return project["checkpoint"]
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
             return RiskCheckpointEngine.get_latest_checkpoint(conn, project["project_version_id"])
+
+    def _serialize_checkpoint_decision_row(
+        self,
+        row: dict[str, Any],
+        *,
+        version_number: int,
+        checkpoint_status: str,
+        duplicated: bool = False,
+    ) -> dict[str, Any]:
+        expected_canonical, recomputed_hash = _compute_checkpoint_decision_sha256(
+            decision_id=row["id"],
+            checkpoint_id=row["checkpoint_id"],
+            project_id=row["project_id"],
+            project_version_id=row["project_version_id"],
+            decision=row["decision"],
+            justification=row["justification"],
+            conditions=row.get("conditions"),
+            decided_by_user_id=row["decided_by_user_id"],
+            decided_by_name=row.get("decided_by_name"),
+            decided_by_email=row.get("decided_by_email"),
+            decided_at=row["decided_at"],
+        )
+        stored_hash = str(row["integrity_hash_sha256"]).strip()
+        stored_canonical = row.get("canonical_payload")
+        canonical_matches = isinstance(stored_canonical, dict) and stored_canonical == expected_canonical
+        is_valid = hmac.compare_digest(recomputed_hash, stored_hash) and canonical_matches
+        decision_labels = {
+            "approve_continue": "Aprobación para continuar evaluación",
+            "request_correction": "Corrección solicitada (pausa vigente)",
+        }
+        return {
+            "decision_id": row["id"],
+            "checkpoint_id": row["checkpoint_id"],
+            "project_id": row["project_id"],
+            "project_version_id": row["project_version_id"],
+            "version_number": version_number,
+            "decision": row["decision"],
+            "decision_label": decision_labels.get(row["decision"], row["decision"]),
+            "justification": row["justification"],
+            "conditions": row.get("conditions"),
+            "decided_by_user_id": row["decided_by_user_id"],
+            "decided_by_name": row.get("decided_by_name"),
+            "decided_by_email": row.get("decided_by_email"),
+            "decided_at": row["decided_at"],
+            "idempotency_key": row["idempotency_key"],
+            "integrity_hash_sha256": stored_hash,
+            "recomputed_hash_sha256": recomputed_hash,
+            "verification_status": "valid" if is_valid else "failed",
+            "verification_label": "Válida (integridad verificada)" if is_valid else "Fallida (alteración detectada)",
+            "prototype_notice": HU33_PROTOTYPE_NOTICE,
+            "checkpoint_status": checkpoint_status,
+            "duplicated": duplicated,
+        }
+
+    def register_checkpoint_decision(
+        self,
+        *,
+        project_id: UUID,
+        actor_id: UUID,
+        actor_name: str | None,
+        actor_email: str | None,
+        decision: str,
+        justification: str,
+        conditions: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Registra una decisión autenticada y con huella SHA-256 sobre un checkpoint pendiente (HU3.3)."""
+        cleaned_key = idempotency_key.strip()
+        if not cleaned_key:
+            raise ConfiguracionPMV1Error("Idempotency-Key es obligatorio")
+
+        cleaned_decision = decision.strip().lower()
+        if cleaned_decision not in ("approve_continue", "request_correction"):
+            raise ConfiguracionPMV1Error("Decisión inválida. Use 'approve_continue' o 'request_correction'.")
+
+        cleaned_justification = justification.strip() if justification else ""
+        if len(cleaned_justification) < 5:
+            raise ConfiguracionPMV1Error("El fundamento de la decisión debe tener al menos 5 caracteres.")
+
+        cleaned_conditions = conditions.strip() if conditions and conditions.strip() else None
+        if cleaned_decision == "request_correction" and not cleaned_conditions:
+            raise ConfiguracionPMV1Error(
+                "Al solicitar una corrección debe especificar las observaciones o correcciones requeridas."
+            )
+
+        project = self.get_project(project_id)
+        version_id = project["project_version_id"]
+        version_number = int(project.get("version_number") or 1)
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            prev = conn.execute(
+                """
+                SELECT d.*, c.status AS cp_status
+                FROM checkpoint_review_decisions d
+                JOIN evaluation_checkpoints c ON c.id = d.checkpoint_id
+                WHERE d.idempotency_key = %s
+                """,
+                (cleaned_key,),
+            ).fetchone()
+            if prev:
+                if prev["project_id"] != project_id or prev["project_version_id"] != version_id:
+                    raise ConfiguracionPMV1Error("Idempotency-Key ya fue utilizada para otro expediente o versión.")
+                if (
+                    prev["decision"] != cleaned_decision
+                    or prev["justification"] != cleaned_justification
+                    or (prev.get("conditions") or None) != cleaned_conditions
+                ):
+                    raise ConfiguracionPMV1Error(
+                        "Idempotency-Key no puede reutilizarse con decisión, fundamento o condiciones distintas."
+                    )
+                return self._serialize_checkpoint_decision_row(
+                    prev,
+                    version_number=version_number,
+                    checkpoint_status=prev["cp_status"],
+                    duplicated=True,
+                )
+
+            cp_row = conn.execute(
+                """
+                SELECT id, status
+                FROM evaluation_checkpoints
+                WHERE project_version_id = %s
+                  AND checkpoint_type = 'high_risk_pause'
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (version_id,),
+            ).fetchone()
+
+            if not cp_row:
+                raise RecursoPMV1NoEncontradoError(
+                    f"No existe un punto de control (checkpoint) para la versión vigente ({version_id})."
+                )
+            if cp_row["status"] != "pending_review":
+                raise ConfiguracionPMV1Error(
+                    f"El punto de control de la versión vigente está en estado '{cp_row['status']}', "
+                    "no en 'pending_review'."
+                )
+
+            decision_id = uuid4()
+            decided_at = datetime.now(timezone.utc)
+            canonical_payload, integrity_hash = _compute_checkpoint_decision_sha256(
+                decision_id=decision_id,
+                checkpoint_id=cp_row["id"],
+                project_id=project_id,
+                project_version_id=version_id,
+                decision=cleaned_decision,
+                justification=cleaned_justification,
+                conditions=cleaned_conditions,
+                decided_by_user_id=actor_id,
+                decided_by_name=actor_name,
+                decided_by_email=actor_email,
+                decided_at=decided_at,
+            )
+
+            inserted = conn.execute(
+                """
+                INSERT INTO checkpoint_review_decisions
+                (id, checkpoint_id, project_id, project_version_id, decision, justification,
+                 conditions, decided_by_user_id, decided_by_name, decided_by_email, decided_at,
+                 idempotency_key, canonical_payload, integrity_hash_sha256)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    decision_id,
+                    cp_row["id"],
+                    project_id,
+                    version_id,
+                    cleaned_decision,
+                    cleaned_justification,
+                    cleaned_conditions,
+                    actor_id,
+                    actor_name,
+                    actor_email,
+                    decided_at,
+                    cleaned_key,
+                    Jsonb(canonical_payload),
+                    integrity_hash,
+                ),
+            ).fetchone()
+
+            conn.execute(
+                """
+                INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, 'CHECKPOINT_DECISION_RECORDED', 'checkpoint_decision', %s, %s)
+                """,
+                (
+                    actor_id,
+                    decision_id,
+                    Jsonb({
+                        "project_id": str(project_id),
+                        "project_version_id": str(version_id),
+                        "checkpoint_id": str(cp_row["id"]),
+                        "decision": cleaned_decision,
+                    }),
+                ),
+            )
+
+            return self._serialize_checkpoint_decision_row(
+                inserted,
+                version_number=version_number,
+                checkpoint_status=cp_row["status"],
+                duplicated=False,
+            )
+
+    def list_checkpoint_decisions(self, project_id: UUID) -> dict[str, Any]:
+        """Consulta y verifica en solo lectura la integridad SHA-256 de las decisiones de la versión vigente (HU3.3)."""
+        project = self.get_project(project_id)
+        version_id = project["project_version_id"]
+        version_number = int(project.get("version_number") or 1)
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                SELECT d.*, c.status AS cp_status
+                FROM checkpoint_review_decisions d
+                JOIN evaluation_checkpoints c ON c.id = d.checkpoint_id
+                WHERE d.project_id = %s AND d.project_version_id = %s
+                ORDER BY d.decided_at DESC, d.created_at DESC
+                """,
+                (project_id, version_id),
+            ).fetchall()
+
+        decisions = [
+            self._serialize_checkpoint_decision_row(
+                r,
+                version_number=version_number,
+                checkpoint_status=r["cp_status"],
+            )
+            for r in rows
+        ]
+        return {
+            "project_id": project_id,
+            "project_version_id": version_id,
+            "version_number": version_number,
+            "decisions": decisions,
+            "prototype_notice": HU33_PROTOTYPE_NOTICE,
+        }
+
+    def _resolve_actor_names(self, actor_ids: list[UUID]) -> dict[UUID, str]:
+        """Consulta en solo lectura los nombres reales en auth_db sin inventar cuentas inexistentes."""
+        unique_ids = list({aid for aid in actor_ids if aid is not None})
+        if not unique_ids:
+            return {}
+        raw_auth = self.auth_db_url or os.getenv("AUTH_DB_URL") or get_settings().auth_db_url
+        auth_dsn = _dsn(raw_auth)
+        try:
+            if not _is_db_available(auth_dsn):
+                return {}
+            with psycopg.connect(auth_dsn, row_factory=dict_row) as conn:
+                rows = conn.execute(
+                    "SELECT id, full_name FROM users WHERE id = ANY(%s)",
+                    (unique_ids,),
+                ).fetchall()
+            return {r["id"]: str(r["full_name"]) for r in rows if r.get("full_name")}
+        except Exception:
+            return {}
+
+    def list_auditable_projects(self) -> dict[str, Any]:
+        """Lista los expedientes disponibles para consulta de auditoria en solo lectura (HU5.3)."""
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                SELECT p.id AS project_id, p.code, p.status, p.created_at, p.updated_at,
+                       latest.title, latest.version_number AS current_version_number,
+                       (SELECT COUNT(*) FROM project_versions pv2 WHERE pv2.project_id = p.id) AS versions_count
+                FROM projects p
+                JOIN LATERAL (
+                    SELECT title, version_number
+                    FROM project_versions pv
+                    WHERE pv.project_id = p.id
+                    ORDER BY pv.version_number DESC
+                    LIMIT 1
+                ) latest ON TRUE
+                ORDER BY p.updated_at DESC, p.created_at DESC, p.code ASC
+                """
+            ).fetchall()
+        return {"projects": [dict(r) for r in rows]}
+
+    def get_project_history(self, project_id: UUID) -> dict[str, Any]:
+        """Reconstruye en solo lectura el historial cronologico completo de un expediente (HU5.3)."""
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            proj = conn.execute(
+                "SELECT id, code, status, created_by_user_id, created_at, updated_at FROM projects WHERE id = %s",
+                (project_id,),
+            ).fetchone()
+            if not proj:
+                raise RecursoPMV1NoEncontradoError("Expediente no encontrado.")
+
+            version_rows = conn.execute(
+                """
+                SELECT id, project_id, version_number, title, estimated_budget_pen,
+                       beneficiaries_count, created_by_user_id, created_at
+                FROM project_versions
+                WHERE project_id = %s
+                ORDER BY version_number ASC, created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+            if not version_rows:
+                raise RecursoPMV1NoEncontradoError("El expediente no tiene versiones registradas.")
+
+            version_ids = [v["id"] for v in version_rows]
+            version_num_by_id = {v["id"]: int(v["version_number"]) for v in version_rows}
+            latest_v = version_rows[-1]
+
+            eval_rows = conn.execute(
+                """
+                SELECT e.id, e.project_version_id, e.requested_by_user_id, e.status,
+                       e.requested_at, e.started_at, e.finished_at, e.error_message,
+                       cv.version_number AS criteria_version_number,
+                       erp.score_0_100, erp.cost_per_beneficiary_pen, erp.received_at AS projection_received_at
+                FROM evaluations e
+                LEFT JOIN criteria_versions cv ON cv.id = e.criteria_version_id
+                LEFT JOIN economic_result_projections erp ON erp.evaluation_id = e.id
+                WHERE e.project_version_id = ANY(%s)
+                ORDER BY e.requested_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            social_rows = conn.execute(
+                """
+                SELECT id, project_version_id, requested_by_user_id, status, social_score, summary, evaluated_at
+                FROM social_accessibility_assessments
+                WHERE project_version_id = ANY(%s)
+                ORDER BY evaluated_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            env_rows = conn.execute(
+                """
+                SELECT id, project_version_id, assessed_by_user_id, status, risk_level,
+                       environmental_score, favorable, summary, evaluated_at
+                FROM environmental_assessments
+                WHERE project_version_id = ANY(%s)
+                ORDER BY evaluated_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            tech_rows = conn.execute(
+                """
+                SELECT id, project_version_id, requested_by_user_id, status, overall_result,
+                       overall_result_label, technical_score, summary, evaluated_at
+                FROM technical_feasibility_assessments
+                WHERE project_version_id = ANY(%s)
+                ORDER BY evaluated_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            legal_rows = conn.execute(
+                """
+                SELECT id, project_version_id, status, summary, verifiable_citations_count,
+                       unverifiable_citations_count, has_legal_alert, legal_alert_norm,
+                       is_resolved, evaluated_at
+                FROM legal_assessments
+                WHERE project_id = %s AND (project_version_id = ANY(%s) OR project_version_id IS NULL)
+                ORDER BY evaluated_at ASC
+                """,
+                (project_id, version_ids),
+            ).fetchall()
+
+            legal_res_rows = conn.execute(
+                """
+                SELECT id, project_version_id, resolved_by_user_id, resolution_action,
+                       justification, evidence_reference, resolved_at
+                FROM legal_alert_resolutions
+                WHERE project_id = %s
+                ORDER BY resolved_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+            zoning_rows = conn.execute(
+                """
+                SELECT id, project_version_id, requested_by_user_id, status, compatible,
+                       source_document, source_locator, limitations, requested_at, reviewed_at
+                FROM zoning_review_requests
+                WHERE project_version_id = ANY(%s)
+                ORDER BY requested_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            pert_rows = conn.execute(
+                """
+                SELECT id, project_version_id, registered_by_user_id, expected_duration,
+                       standard_deviation, time_unit, created_at
+                FROM project_pert_estimates
+                WHERE project_id = %s
+                ORDER BY created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+            geo_rows = conn.execute(
+                """
+                SELECT id, project_version_id, layer_type, layer_name, data_origin,
+                       availability_status, created_by_user_id, created_at
+                FROM project_geospatial_layers
+                WHERE project_version_id = ANY(%s)
+                ORDER BY created_at ASC
+                """,
+                (version_ids,),
+            ).fetchall()
+
+            cp_rows = conn.execute(
+                """
+                SELECT id, project_version_id, checkpoint_type, status, reason, risk_source,
+                       risk_level, resolved_by_user_id, resolution_motive, resolution_conditions,
+                       resolved_at, created_at
+                FROM evaluation_checkpoints
+                WHERE project_id = %s
+                ORDER BY created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+            cp_decision_rows = conn.execute(
+                """
+                SELECT d.*, c.status AS cp_status
+                FROM checkpoint_review_decisions d
+                JOIN evaluation_checkpoints c ON c.id = d.checkpoint_id
+                WHERE d.project_id = %s
+                ORDER BY d.decided_at ASC, d.created_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+            approval_rows = conn.execute(
+                """
+                SELECT id, project_version_id, decision, justification, conditions,
+                       decided_by_user_id, decided_at
+                FROM human_approvals
+                WHERE project_id = %s
+                ORDER BY decided_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+
+            candidate_entity_ids = (
+                [project_id]
+                + list(version_ids)
+                + [r["id"] for r in eval_rows]
+                + [r["id"] for r in social_rows]
+                + [r["id"] for r in env_rows]
+                + [r["id"] for r in tech_rows]
+                + [r["id"] for r in legal_rows]
+                + [r["id"] for r in legal_res_rows]
+                + [r["id"] for r in zoning_rows]
+                + [r["id"] for r in pert_rows]
+                + [r["id"] for r in cp_rows]
+                + [r["id"] for r in cp_decision_rows]
+                + [r["id"] for r in approval_rows]
+            )
+            audit_rows = conn.execute(
+                """
+                SELECT id, actor_user_id, action, entity_type, entity_id, details, occurred_at
+                FROM audit_events
+                WHERE entity_id = ANY(%s)
+                   OR details->>'project_id' = %s
+                ORDER BY occurred_at ASC, id ASC
+                """,
+                (candidate_entity_ids, str(project_id)),
+            ).fetchall()
+
+        # Recolectar todos los UUID de actores para consulta unica a auth_db (sin hashes ni secretos)
+        actor_ids: list[UUID] = [proj["created_by_user_id"]]
+        for r in version_rows:
+            actor_ids.append(r["created_by_user_id"])
+        for r in eval_rows:
+            actor_ids.append(r["requested_by_user_id"])
+        for r in social_rows:
+            actor_ids.append(r["requested_by_user_id"])
+        for r in env_rows:
+            actor_ids.append(r["assessed_by_user_id"])
+        for r in tech_rows:
+            actor_ids.append(r["requested_by_user_id"])
+        for r in legal_res_rows:
+            actor_ids.append(r["resolved_by_user_id"])
+        for r in zoning_rows:
+            actor_ids.append(r["requested_by_user_id"])
+        for r in pert_rows:
+            actor_ids.append(r["registered_by_user_id"])
+        for r in geo_rows:
+            actor_ids.append(r["created_by_user_id"])
+        for r in cp_rows:
+            if r.get("resolved_by_user_id"):
+                actor_ids.append(r["resolved_by_user_id"])
+        for r in cp_decision_rows:
+            actor_ids.append(r["decided_by_user_id"])
+        for r in approval_rows:
+            actor_ids.append(r["decided_by_user_id"])
+        for r in audit_rows:
+            if r.get("actor_user_id"):
+                actor_ids.append(r["actor_user_id"])
+
+        actor_names = self._resolve_actor_names(actor_ids)
+
+        timeline: list[tuple[datetime, int, str, dict[str, Any]]] = []
+
+        def _add(ts: datetime, priority: int, item: dict[str, Any]) -> None:
+            timeline.append((ts, priority, item["event_id"], item))
+
+        for v in version_rows:
+            vid = v["id"]
+            vnum = int(v["version_number"])
+            _add(
+                v["created_at"],
+                10,
+                {
+                    "event_id": f"version:{vid}",
+                    "event_type": "VERSION_CREATED",
+                    "category": "version",
+                    "title": f"Creación de versión v{vnum}" if vnum > 1 else "Registro inicial del expediente (v1)",
+                    "source": "Registro de versiones del expediente",
+                    "occurred_at": v["created_at"],
+                    "project_version_id": vid,
+                    "version_number": vnum,
+                    "actor_user_id": v["created_by_user_id"],
+                    "actor_name": actor_names.get(v["created_by_user_id"]),
+                    "result": f"Versión v{vnum}",
+                    "detail": (
+                        f"{v['title']} · Presupuesto: S/ {float(v['estimated_budget_pen']):,.2f} · "
+                        f"Beneficiarios est.: {v['beneficiaries_count']:,}"
+                    ),
+                },
+            )
+
+        for g in geo_rows:
+            vid = g["project_version_id"]
+            _add(
+                g["created_at"],
+                20,
+                {
+                    "event_id": f"geo:{g['id']}",
+                    "event_type": "GEOSPATIAL_LAYER_REGISTERED",
+                    "category": "territorial",
+                    "title": f"Capa geoespacial registrada ({g['layer_name']})",
+                    "source": "Capas geoespaciales",
+                    "occurred_at": g["created_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": g["created_by_user_id"],
+                    "actor_name": actor_names.get(g["created_by_user_id"]),
+                    "result": f"{g['layer_type']} · {g['availability_status']}",
+                    "detail": f"Origen: {g['data_origin']}",
+                },
+            )
+
+        for p_est in pert_rows:
+            vid = p_est["project_version_id"]
+            _add(
+                p_est["created_at"],
+                25,
+                {
+                    "event_id": f"pert:{p_est['id']}",
+                    "event_type": "PERT_ESTIMATE",
+                    "category": "evaluation",
+                    "title": "Estimación de duración PERT",
+                    "source": "Estimación de plazos PERT",
+                    "occurred_at": p_est["created_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": p_est["registered_by_user_id"],
+                    "actor_name": actor_names.get(p_est["registered_by_user_id"]),
+                    "result": f"{float(p_est['expected_duration']):.2f} {p_est['time_unit']}",
+                    "detail": f"Desviación estándar: {float(p_est['standard_deviation']):.2f} {p_est['time_unit']}",
+                },
+            )
+
+        for z in zoning_rows:
+            vid = z["project_version_id"]
+            ts = z.get("reviewed_at") or z["requested_at"]
+            compat = (
+                "Compatible" if z["compatible"] is True else ("No compatible" if z["compatible"] is False else "Pendiente de revisión")
+            )
+            doc_txt = f"{z['source_document']} ({z['source_locator']})" if z.get("source_document") else z["limitations"]
+            _add(
+                ts,
+                30,
+                {
+                    "event_id": f"zoning:{z['id']}",
+                    "event_type": "ZONING_REVIEW",
+                    "category": "review",
+                    "title": "Revisión de zonificación territorial",
+                    "source": "Revisión de zonificación",
+                    "occurred_at": ts,
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": z["requested_by_user_id"],
+                    "actor_name": actor_names.get(z["requested_by_user_id"]),
+                    "result": f"{z['status']} · {compat}",
+                    "detail": str(doc_txt),
+                },
+            )
+
+        for s in social_rows:
+            vid = s["project_version_id"]
+            score_txt = f"{float(s['social_score']):.2f} pts" if s.get("social_score") is not None else "Sin puntaje"
+            _add(
+                s["evaluated_at"],
+                35,
+                {
+                    "event_id": f"social:{s['id']}",
+                    "event_type": "SOCIAL_ASSESSMENT",
+                    "category": "evaluation",
+                    "title": "Evaluación social y equidad territorial",
+                    "source": "Evaluación social",
+                    "occurred_at": s["evaluated_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": s["requested_by_user_id"],
+                    "actor_name": actor_names.get(s["requested_by_user_id"]),
+                    "result": f"{s['status']} · {score_txt}",
+                    "detail": str(s["summary"]),
+                },
+            )
+
+        for env in env_rows:
+            vid = env["project_version_id"]
+            score_txt = f"{float(env['environmental_score']):.2f} pts" if env.get("environmental_score") is not None else "Sin puntaje"
+            _add(
+                env["evaluated_at"],
+                40,
+                {
+                    "event_id": f"env:{env['id']}",
+                    "event_type": "ENVIRONMENTAL_ASSESSMENT",
+                    "category": "evaluation",
+                    "title": "Evaluación ambiental",
+                    "source": "Evaluación ambiental",
+                    "occurred_at": env["evaluated_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": env["assessed_by_user_id"],
+                    "actor_name": actor_names.get(env["assessed_by_user_id"]),
+                    "result": f"{env['status']} · Riesgo {env['risk_level']} · {score_txt}",
+                    "detail": str(env.get("risk_observation") or env["summary"]),
+                },
+            )
+
+        for tech in tech_rows:
+            vid = tech["project_version_id"]
+            score_txt = f"{float(tech['technical_score']):.2f} pts" if tech.get("technical_score") is not None else "Sin puntaje"
+            _add(
+                tech["evaluated_at"],
+                45,
+                {
+                    "event_id": f"tech:{tech['id']}",
+                    "event_type": "TECHNICAL_ASSESSMENT",
+                    "category": "evaluation",
+                    "title": "Evaluación de viabilidad técnica",
+                    "source": "Evaluación técnica",
+                    "occurred_at": tech["evaluated_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": tech["requested_by_user_id"],
+                    "actor_name": actor_names.get(tech["requested_by_user_id"]),
+                    "result": f"{tech['overall_result_label']} · {score_txt}",
+                    "detail": str(tech["summary"]),
+                },
+            )
+
+        consumed_audit_ids: set[UUID] = set()
+        for leg in legal_rows:
+            vid = leg.get("project_version_id")
+            leg_ts = leg["evaluated_at"]
+            matched_eval_ae = None
+            best_diff = 5.0
+            for ae in audit_rows:
+                if ae["id"] in consumed_audit_ids:
+                    continue
+                if ae["action"] == "LEGAL_ASSESSMENT_EVALUATED":
+                    diff = abs((ae["occurred_at"] - leg_ts).total_seconds())
+                    if diff <= best_diff:
+                        best_diff = diff
+                        matched_eval_ae = ae
+            if matched_eval_ae is not None:
+                consumed_audit_ids.add(matched_eval_ae["id"])
+            for ae in audit_rows:
+                if ae["id"] not in consumed_audit_ids and ae["action"] == "LEGAL_PRECHECK_REQUIRES_REVIEW":
+                    if abs((ae["occurred_at"] - leg_ts).total_seconds()) <= 5.0:
+                        consumed_audit_ids.add(ae["id"])
+            leg_actor_id = matched_eval_ae.get("actor_user_id") if matched_eval_ae else None
+            _add(
+                leg_ts,
+                50,
+                {
+                    "event_id": f"legal:{leg['id']}",
+                    "event_type": "LEGAL_ASSESSMENT",
+                    "category": "evaluation",
+                    "title": "Evaluación jurídica",
+                    "source": "Evaluación jurídica",
+                    "occurred_at": leg_ts,
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid) if vid else None,
+                    "actor_user_id": leg_actor_id,
+                    "actor_name": actor_names.get(leg_actor_id) if leg_actor_id else None,
+                    "result": (
+                        f"{leg['status']} ({leg['verifiable_citations_count']} cita(s) verificable(s))"
+                        + (" · Alerta legal" if leg.get("has_legal_alert") else "")
+                    ),
+                    "detail": str(leg["summary"]),
+                },
+            )
+
+        for lr in legal_res_rows:
+            vid = lr["project_version_id"]
+            _add(
+                lr["resolved_at"],
+                55,
+                {
+                    "event_id": f"legalres:{lr['id']}",
+                    "event_type": "LEGAL_ALERT_RESOLVED",
+                    "category": "review",
+                    "title": f"Resolución de alerta legal ({lr['resolution_action']})",
+                    "source": "Resoluciones de alerta legal",
+                    "occurred_at": lr["resolved_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid),
+                    "actor_user_id": lr["resolved_by_user_id"],
+                    "actor_name": actor_names.get(lr["resolved_by_user_id"]),
+                    "result": str(lr["resolution_action"]),
+                    "detail": str(lr["justification"]),
+                },
+            )
+
+        for ev in eval_rows:
+            vid = ev["project_version_id"]
+            vnum = version_num_by_id.get(vid)
+            c_ver = f"criterios v{ev['criteria_version_number']}" if ev.get("criteria_version_number") else "criterios"
+            _add(
+                ev["requested_at"],
+                60,
+                {
+                    "event_id": f"evalreq:{ev['id']}",
+                    "event_type": "EVALUATION_REQUESTED",
+                    "category": "evaluation",
+                    "title": f"Solicitud de evaluación económica ({c_ver})",
+                    "source": "Evaluaciones económicas",
+                    "occurred_at": ev["requested_at"],
+                    "project_version_id": vid,
+                    "version_number": vnum,
+                    "actor_user_id": ev["requested_by_user_id"],
+                    "actor_name": actor_names.get(ev["requested_by_user_id"]),
+                    "result": str(ev["status"]),
+                    "detail": str(ev.get("error_message") or f"Evaluación registrada con {c_ver}."),
+                },
+            )
+            if ev.get("projection_received_at") is not None and ev.get("score_0_100") is not None:
+                _add(
+                    ev["projection_received_at"],
+                    80,
+                    {
+                        "event_id": f"evaldone:{ev['id']}",
+                        "event_type": "ECONOMIC_EVALUATION_COMPLETED",
+                        "category": "evaluation",
+                        "title": "Resultado de evaluación económica registrado",
+                        "source": "Proyección económica",
+                        "occurred_at": ev["projection_received_at"],
+                        "project_version_id": vid,
+                        "version_number": vnum,
+                        "actor_user_id": None,
+                        "actor_name": None,
+                        "result": f"{float(ev['score_0_100']):.2f} / 100 pts",
+                        "detail": f"Costo por beneficiario: S/ {float(ev['cost_per_beneficiary_pen']):,.2f}",
+                    },
+                )
+
+        for cp in cp_rows:
+            vid = cp["project_version_id"]
+            vnum = version_num_by_id.get(vid)
+            _add(
+                cp["created_at"],
+                65,
+                {
+                    "event_id": f"cp_pause:{cp['id']}",
+                    "event_type": "CHECKPOINT_PAUSED",
+                    "category": "checkpoint",
+                    "title": "Pausa en punto de control por riesgo alto",
+                    "source": "Puntos de control",
+                    "occurred_at": cp["created_at"],
+                    "project_version_id": vid,
+                    "version_number": vnum,
+                    "actor_user_id": None,
+                    "actor_name": None,
+                    "result": f"Riesgo {cp['risk_level']} ({cp['risk_source']})",
+                    "detail": str(cp["reason"]),
+                },
+            )
+            if cp.get("resolved_at") is not None:
+                _add(
+                    cp["resolved_at"],
+                    75,
+                    {
+                        "event_id": f"cp_resume:{cp['id']}",
+                        "event_type": "CHECKPOINT_RESUMED",
+                        "category": "resume",
+                        "title": "Reanudación de evaluación desde punto de control",
+                        "source": "Reanudación de punto de control",
+                        "occurred_at": cp["resolved_at"],
+                        "project_version_id": vid,
+                        "version_number": vnum,
+                        "actor_user_id": cp.get("resolved_by_user_id"),
+                        "actor_name": actor_names.get(cp["resolved_by_user_id"]) if cp.get("resolved_by_user_id") else None,
+                        "result": "Reanudado / Resuelto",
+                        "detail": (
+                            str(cp.get("resolution_motive") or "")
+                            + (f" · Condiciones: {cp['resolution_conditions']}" if cp.get("resolution_conditions") else "")
+                        ),
+                    },
+                )
+
+        for dec in cp_decision_rows:
+            vid = dec["project_version_id"]
+            vnum = version_num_by_id.get(vid, 1)
+            serialized = self._serialize_checkpoint_decision_row(
+                dec,
+                version_number=vnum,
+                checkpoint_status=dec["cp_status"],
+            )
+            uid = dec["decided_by_user_id"]
+            in_dir = uid in actor_names
+            resolved_name = actor_names.get(uid) if in_dir else None
+            _add(
+                dec["decided_at"],
+                70,
+                {
+                    "event_id": f"cp_dec:{dec['id']}",
+                    "event_type": "CHECKPOINT_DECISION",
+                    "category": "decision",
+                    "title": serialized["decision_label"],
+                    "source": "Constancia de decisión sobre punto de control",
+                    "occurred_at": dec["decided_at"],
+                    "project_version_id": vid,
+                    "version_number": vnum,
+                    "actor_user_id": uid,
+                    "actor_name": resolved_name,
+                    "actor_in_directory": in_dir,
+                    "record_id": dec["id"],
+                    "decision_kind": "checkpoint_decision",
+                    "decision_code": str(dec["decision"]),
+                    "justification": str(dec["justification"]),
+                    "conditions": dec.get("conditions"),
+                    "checkpoint_id": dec["checkpoint_id"],
+                    "checkpoint_status": str(dec["cp_status"]),
+                    "has_integrity_hash": bool(serialized["integrity_hash_sha256"]),
+                    "result": serialized["verification_label"],
+                    "detail": (
+                        str(dec["justification"])
+                        + (f" · Condiciones/corrección: {dec['conditions']}" if dec.get("conditions") else "")
+                    ),
+                    "integrity_hash_sha256": serialized["integrity_hash_sha256"],
+                    "verification_status": serialized["verification_status"],
+                    "verification_label": serialized["verification_label"],
+                    "prototype_notice": serialized["prototype_notice"],
+                },
+            )
+
+        for ap in approval_rows:
+            vid = ap["project_version_id"]
+            vnum = version_num_by_id.get(vid)
+            uid = ap["decided_by_user_id"]
+            in_dir = uid in actor_names
+            decision_es = {"approved": "Aprobado", "rejected": "Rechazado", "observed": "Observado"}.get(
+                ap["decision"], ap["decision"]
+            )
+            _add(
+                ap["decided_at"],
+                90,
+                {
+                    "event_id": f"approval:{ap['id']}",
+                    "event_type": "HUMAN_APPROVAL",
+                    "category": "approval",
+                    "title": f"Dictamen final registrado ({decision_es})",
+                    "source": "Dictámenes finales",
+                    "occurred_at": ap["decided_at"],
+                    "project_version_id": vid,
+                    "version_number": vnum,
+                    "actor_user_id": uid,
+                    "actor_name": actor_names.get(uid) if in_dir else None,
+                    "actor_in_directory": in_dir,
+                    "record_id": ap["id"],
+                    "decision_kind": "final_approval",
+                    "decision_code": str(ap["decision"]),
+                    "justification": str(ap["justification"]),
+                    "conditions": ap.get("conditions"),
+                    "checkpoint_id": None,
+                    "checkpoint_status": None,
+                    "has_integrity_hash": False,
+                    "result": decision_es,
+                    "detail": (
+                        str(ap["justification"])
+                        + (f" · Condiciones: {ap['conditions']}" if ap.get("conditions") else "")
+                    ),
+                    "integrity_hash_sha256": None,
+                    "verification_status": None,
+                    "verification_label": "Verificación de integridad no disponible para este registro",
+                    "prototype_notice": (
+                        "Este dictamen final no dispone de constancia criptográfica SHA-256 en el registro actual; "
+                        "no equivale a firma digital certificada con validez jurídica."
+                    ),
+                },
+            )
+
+        # Eventos de audit_events complementarios (excluyendo duplicados ya reconstruidos arriba)
+        covered_actions = {
+            "PROJECT_CREATED",
+            "PROJECT_VERSION_CREATED",
+            "EVALUATION_QUEUED",
+            "EVALUATION_COMPLETED",
+            "EVALUATION_PAUSED_HIGH_RISK",
+            "CHECKPOINT_DECISION_RECORDED",
+            "CHECKPOINT_RESUMED",
+            "PROJECT_HUMAN_APPROVAL_RECORDED",
+            "SOCIAL_ACCESSIBILITY_EVALUATED",
+            "ENVIRONMENTAL_ASSESSMENT_EVALUATED",
+            "TECHNICAL_ASSESSMENT_COMPLETED",
+            "PERT_ESTIMATE_REGISTERED",
+            "ZONING_REVIEW_REQUESTED",
+            "LEGAL_ALERT_RESOLVED",
+            "GEOSPATIAL_LAYER_REGISTERED",
+        }
+        for ae in audit_rows:
+            if ae["id"] in consumed_audit_ids or ae["action"] in covered_actions:
+                continue
+            details = ae.get("details") or {}
+            vid_str = details.get("project_version_id")
+            vid = UUID(vid_str) if vid_str else None
+            uid = ae.get("actor_user_id")
+            action_key = str(ae["action"])
+            title_map = {
+                "LEGAL_ASSESSMENT_EVALUATED": "Evaluación jurídica ejecutada (registro histórico en bitácora)",
+                "LEGAL_PRECHECK_REQUIRES_REVIEW": "Prechequeo normativo con observación para revisión",
+            }
+            if action_key == "LEGAL_ASSESSMENT_EVALUATED":
+                result_txt = f"{details.get('total_findings', 0)} hallazgo(s) · {details.get('verifiable_count', 0)} cita(s) verificable(s)"
+                detail_txt = (
+                    "Con alerta legal."
+                    if details.get("has_legal_alert")
+                    else "Evaluación jurídica registrada en bitácora."
+                )
+            elif action_key == "LEGAL_PRECHECK_REQUIRES_REVIEW":
+                result_txt = "Requiere revisión"
+                detail_txt = "Prechequeo legal ejecutado durante el análisis normativo."
+            else:
+                result_txt = "Registro de bitácora"
+                detail_txt = str(details.get("reason") or details.get("status") or "Evento registrado en bitácora.")
+            _add(
+                ae["occurred_at"],
+                95,
+                {
+                    "event_id": f"audit:{ae['id']}",
+                    "event_type": action_key,
+                    "category": "audit",
+                    "title": title_map.get(action_key, "Evento complementario de bitácora"),
+                    "source": "Bitácora de auditoría",
+                    "occurred_at": ae["occurred_at"],
+                    "project_version_id": vid,
+                    "version_number": version_num_by_id.get(vid) if vid else None,
+                    "actor_user_id": uid,
+                    "actor_name": actor_names.get(uid) if uid else None,
+                    "result": result_txt,
+                    "detail": detail_txt,
+                },
+            )
+
+        timeline.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        versions_summary = [
+            {
+                "project_version_id": v["id"],
+                "version_number": int(v["version_number"]),
+                "title": v["title"],
+                "estimated_budget_pen": v["estimated_budget_pen"],
+                "beneficiaries_count": int(v["beneficiaries_count"]),
+                "created_by_user_id": v["created_by_user_id"],
+                "created_by_name": actor_names.get(v["created_by_user_id"]),
+                "created_at": v["created_at"],
+            }
+            for v in version_rows
+        ]
+
+        return {
+            "project_id": proj["id"],
+            "code": proj["code"],
+            "current_title": latest_v["title"],
+            "current_status": proj["status"],
+            "current_version_id": latest_v["id"],
+            "current_version_number": int(latest_v["version_number"]),
+            "versions": versions_summary,
+            "events": [item[3] for item in timeline],
+            "historical_limitations": [
+                "Las evaluaciones jurídicas, técnicas y estimaciones PERT conservan un registro único por versión si no se emitieron eventos previos adicionales.",
+                "El registro de evaluación jurídica no almacena columna directa de autor; se muestra el actor únicamente cuando consta en eventos de auditoría o si se crea una nueva versión.",
+                "Los dictámenes finales de aprobación no guardan huella SHA-256 en el esquema vigente; su verificación criptográfica de integridad no está disponible.",
+                "La verificación de integridad SHA-256 sobre decisiones de puntos de control detecta alteraciones internas del contenido, pero no equivale a firma digital certificada con validez jurídica.",
+            ],
+            "read_only": True,
+            "generated_at": datetime.now(timezone.utc),
+        }
+
+    def verify_decision_integrity(
+        self,
+        *,
+        project_id: UUID,
+        project_version_id: UUID,
+        decision_id: UUID,
+    ) -> dict[str, Any]:
+        """Comprueba en vivo (solo lectura) la integridad SHA-256 de una decisión perteneciente al expediente y versión."""
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        checked_at = datetime.now(timezone.utc)
+        prototype_notice = (
+            "Constancia de integridad SHA-256 del prototipo académico SIPRIM: detecta alteraciones del contenido "
+            "respecto a la huella almacenada, pero no constituye firma digital certificada con validez jurídica."
+        )
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            cp_dec = conn.execute(
+                """
+                SELECT d.*,
+                       c.status AS cp_status,
+                       p.code AS project_code,
+                       v.version_number,
+                       v.title AS project_title
+                FROM checkpoint_review_decisions d
+                JOIN evaluation_checkpoints c ON c.id = d.checkpoint_id
+                JOIN projects p ON p.id = d.project_id
+                JOIN project_versions v ON v.id = d.project_version_id AND v.project_id = p.id
+                WHERE d.id = %s AND d.project_id = %s AND d.project_version_id = %s
+                """,
+                (decision_id, project_id, project_version_id),
+            ).fetchone()
+
+            if cp_dec is not None:
+                expected_canonical, recomputed_hash = _compute_checkpoint_decision_sha256(
+                    decision_id=cp_dec["id"],
+                    checkpoint_id=cp_dec["checkpoint_id"],
+                    project_id=cp_dec["project_id"],
+                    project_version_id=cp_dec["project_version_id"],
+                    decision=cp_dec["decision"],
+                    justification=cp_dec["justification"],
+                    conditions=cp_dec.get("conditions"),
+                    decided_by_user_id=cp_dec["decided_by_user_id"],
+                    decided_by_name=cp_dec.get("decided_by_name"),
+                    decided_by_email=cp_dec.get("decided_by_email"),
+                    decided_at=cp_dec["decided_at"],
+                )
+                stored_hash = str(cp_dec["integrity_hash_sha256"] or "").strip()
+                stored_canonical = cp_dec.get("canonical_payload")
+                canonical_matches = isinstance(stored_canonical, dict) and stored_canonical == expected_canonical
+                is_valid = bool(stored_hash) and hmac.compare_digest(recomputed_hash, stored_hash) and canonical_matches
+
+                uid = cp_dec["decided_by_user_id"]
+                actor_names = self._resolve_actor_names([uid])
+                in_dir = uid in actor_names
+                decision_labels = {
+                    "approve_continue": "Aprobación para continuar evaluación",
+                    "request_correction": "Corrección solicitada (pausa vigente)",
+                }
+                return {
+                    "project_id": cp_dec["project_id"],
+                    "project_code": cp_dec["project_code"],
+                    "project_title": cp_dec["project_title"],
+                    "project_version_id": cp_dec["project_version_id"],
+                    "version_number": int(cp_dec["version_number"]),
+                    "decision_id": cp_dec["id"],
+                    "decision_kind": "checkpoint_decision",
+                    "checkpoint_id": cp_dec["checkpoint_id"],
+                    "checkpoint_status": str(cp_dec["cp_status"]),
+                    "decision": str(cp_dec["decision"]),
+                    "decision_label": decision_labels.get(cp_dec["decision"], str(cp_dec["decision"])),
+                    "justification": str(cp_dec["justification"]),
+                    "conditions": cp_dec.get("conditions"),
+                    "decided_by_user_id": uid,
+                    "decided_by_name": actor_names.get(uid) if in_dir else None,
+                    "actor_in_directory": in_dir,
+                    "decided_at": cp_dec["decided_at"],
+                    "has_integrity_hash": True,
+                    "integrity_status": "intact" if is_valid else "tampered",
+                    "integrity_label": "Íntegra" if is_valid else "Alteración detectada",
+                    "stored_hash_sha256": stored_hash,
+                    "recomputed_hash_sha256": recomputed_hash,
+                    "canonical_payload_matches": canonical_matches,
+                    "checked_at": checked_at,
+                    "prototype_notice": prototype_notice,
+                    "read_only": True,
+                }
+
+            ap = conn.execute(
+                """
+                SELECT a.*,
+                       p.code AS project_code,
+                       v.version_number,
+                       v.title AS project_title
+                FROM human_approvals a
+                JOIN projects p ON p.id = a.project_id
+                JOIN project_versions v ON v.id = a.project_version_id AND v.project_id = p.id
+                WHERE a.id = %s AND a.project_id = %s AND a.project_version_id = %s
+                """,
+                (decision_id, project_id, project_version_id),
+            ).fetchone()
+
+            if ap is not None:
+                uid = ap["decided_by_user_id"]
+                actor_names = self._resolve_actor_names([uid])
+                in_dir = uid in actor_names
+                decision_es = {"approved": "Aprobado", "rejected": "Rechazado", "observed": "Observado"}.get(
+                    ap["decision"], str(ap["decision"])
+                )
+                return {
+                    "project_id": ap["project_id"],
+                    "project_code": ap["project_code"],
+                    "project_title": ap["project_title"],
+                    "project_version_id": ap["project_version_id"],
+                    "version_number": int(ap["version_number"]),
+                    "decision_id": ap["id"],
+                    "decision_kind": "final_approval",
+                    "checkpoint_id": None,
+                    "checkpoint_status": None,
+                    "decision": str(ap["decision"]),
+                    "decision_label": f"Dictamen final registrado ({decision_es})",
+                    "justification": str(ap["justification"]),
+                    "conditions": ap.get("conditions"),
+                    "decided_by_user_id": uid,
+                    "decided_by_name": actor_names.get(uid) if in_dir else None,
+                    "actor_in_directory": in_dir,
+                    "decided_at": ap["decided_at"],
+                    "has_integrity_hash": False,
+                    "integrity_status": "unavailable",
+                    "integrity_label": "Verificación de integridad no disponible para este registro",
+                    "stored_hash_sha256": None,
+                    "recomputed_hash_sha256": None,
+                    "canonical_payload_matches": None,
+                    "checked_at": checked_at,
+                    "prototype_notice": (
+                        "Este dictamen final no dispone de constancia criptográfica SHA-256 en el registro actual; "
+                        "no se marca como íntegro ni equivale a una firma digital certificada con validez jurídica."
+                    ),
+                    "read_only": True,
+                }
+
+        raise RecursoPMV1NoEncontradoError(
+            "No se encontró la decisión solicitada para el expediente y versión indicados."
+        )
 
     def get_project_by_code(self, code: str) -> dict[str, Any]:
         normalized = code.strip()
@@ -3120,8 +4624,8 @@ class PlatformService:
 
     def _verify_legal_resolution_actor(self, actor_id: UUID) -> None:
         """Verifica que el actor tenga rol LEGAL_ADVISOR, ADMIN o SUPERADMIN en auth_db."""
-        settings = get_settings()
-        auth_dsn = _dsn(settings.auth_db_url)
+        raw_auth = self.auth_db_url or os.getenv("AUTH_DB_URL") or get_settings().auth_db_url
+        auth_dsn = _dsn(raw_auth)
         with psycopg.connect(auth_dsn, row_factory=dict_row) as conn:
             rows = conn.execute(
                 """
@@ -4183,6 +5687,552 @@ class PlatformService:
                 "blocking_reasons": blocking_reasons,
                 "generated_at": datetime.now(timezone.utc),
             }
+
+    def get_project_map_ranking(self) -> dict[str, Any]:
+        """Ranking determinista de proyectos comparables en mapa (HU4.1).
+
+        Reutiliza get_unified_assessment_summary (HU1.12) para puntuacion, pesos y formula,
+        y excluye del orden numerico expedientes incompletos, bloqueados o evaluados con
+        una version de criterios distinta a la vigente. Nunca inventa coordenadas.
+        """
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            active_crit = conn.execute(
+                """
+                SELECT id, version_number
+                FROM criteria_versions
+                WHERE status = 'active'
+                LIMIT 1
+                """
+            ).fetchone()
+
+            project_rows = conn.execute(
+                """
+                SELECT DISTINCT ON (p.id)
+                       p.id AS project_id,
+                       p.code,
+                       p.status AS db_status,
+                       pv.id AS project_version_id,
+                       pv.version_number,
+                       pv.title,
+                       pv.location_description AS location,
+                       pv.estimated_budget_pen,
+                       pv.beneficiaries_count,
+                       pv.latitude,
+                       pv.longitude,
+                       pv.coordinates_origin,
+                       pv.coordinates_source,
+                       (
+                           SELECT e.criteria_version_id
+                           FROM evaluations e
+                           WHERE e.project_version_id = pv.id
+                           ORDER BY e.requested_at DESC
+                           LIMIT 1
+                       ) AS eval_criteria_version_id,
+                       (
+                           SELECT COUNT(*)::int
+                           FROM project_geospatial_layers gl
+                           WHERE gl.project_version_id = pv.id
+                             AND gl.availability_status = 'available'
+                       ) AS geospatial_layers_count
+                FROM projects p
+                JOIN project_versions pv ON pv.project_id = p.id
+                ORDER BY p.id, pv.version_number DESC
+                """
+            ).fetchall()
+
+        comparable_candidates: list[dict[str, Any]] = []
+        excluded_projects: list[dict[str, Any]] = []
+
+        active_crit_id = active_crit["id"] if active_crit else None
+        active_crit_num = active_crit["version_number"] if active_crit else None
+
+        for row in project_rows:
+            pid = row["project_id"]
+            vid = row["project_version_id"]
+            lat = float(row["latitude"]) if row.get("latitude") is not None else None
+            lon = float(row["longitude"]) if row.get("longitude") is not None else None
+            coord_source = (row.get("coordinates_source") or "").strip() or None
+            has_coords = (lat is not None and lon is not None and coord_source is not None)
+
+            summary = self.get_unified_assessment_summary(pid, version_id=vid)
+            gscore = summary["global_score"]
+
+            exclusion_code: str | None = None
+            exclusion_reason: str | None = None
+
+            if active_crit_id is None:
+                exclusion_code = "no_active_criteria"
+                exclusion_reason = "No existe una version activa de criterios y pesos normativos."
+            elif summary["status"] == "blocked":
+                exclusion_code = "blocked"
+                exclusion_reason = "; ".join(summary["blocking_reasons"]) or "Expediente bloqueado por alerta legal o punto de control HITL."
+            elif not summary["is_complete"] or not gscore["is_calculated"] or gscore["score"] is None:
+                exclusion_code = "incomplete"
+                missing = ", ".join(summary["missing_dimensions"])
+                exclusion_reason = (
+                    f"Evaluacion multidimensional incompleta ({missing}). "
+                    "No se asigna puntaje ni posicion ficticia."
+                    if missing
+                    else gscore.get("explanation") or "Puntuacion global no calculable."
+                )
+            elif (
+                row.get("eval_criteria_version_id") is not None
+                and row["eval_criteria_version_id"] != active_crit_id
+            ):
+                exclusion_code = "criteria_version_mismatch"
+                exclusion_reason = (
+                    f"Evaluacion economica ejecutada con una version de criterios distinta a la vigente (v{active_crit_num}). "
+                    "Requiere reevaluacion para ser comparable."
+                )
+
+            if exclusion_code is not None:
+                excluded_projects.append({
+                    "project_id": pid,
+                    "project_version_id": vid,
+                    "code": row["code"],
+                    "version_number": row["version_number"],
+                    "title": row["title"],
+                    "status": summary["status"],
+                    "exclusion_code": exclusion_code,
+                    "exclusion_reason": exclusion_reason,
+                    "missing_dimensions": summary["missing_dimensions"],
+                    "blocking_reasons": summary["blocking_reasons"],
+                    "has_coordinates": has_coords,
+                    "latitude": lat,
+                    "longitude": lon,
+                })
+                continue
+
+            comparable_candidates.append({
+                "project_id": pid,
+                "project_version_id": vid,
+                "code": row["code"],
+                "version_number": row["version_number"],
+                "title": row["title"],
+                "status": summary["status"],
+                "location": row["location"],
+                "estimated_budget_pen": row["estimated_budget_pen"],
+                "beneficiaries_count": row["beneficiaries_count"],
+                "global_score": float(gscore["score"]),
+                "formula": gscore["formula"],
+                "explanation": gscore["explanation"],
+                "criteria_version_number": gscore["criteria_version_number"] or active_crit_num,
+                "weights": gscore["weights"],
+                "input_scores": gscore["input_scores"],
+                "has_coordinates": has_coords,
+                "latitude": lat if has_coords else None,
+                "longitude": lon if has_coords else None,
+                "coordinates_origin": row.get("coordinates_origin") if has_coords else None,
+                "coordinates_source": coord_source if has_coords else None,
+                "allows_final_approval": summary["allows_final_approval"],
+                "geospatial_layers_count": int(row.get("geospatial_layers_count") or 0),
+            })
+
+        comparable_candidates.sort(
+            key=lambda item: (
+                -item["global_score"],
+                -item["beneficiaries_count"],
+                float(item["estimated_budget_pen"]),
+                item["code"],
+                str(item["project_id"]),
+            )
+        )
+
+        score_counts: dict[float, int] = {}
+        for item in comparable_candidates:
+            s = item["global_score"]
+            score_counts[s] = score_counts.get(s, 0) + 1
+
+        ranked_projects: list[dict[str, Any]] = []
+        for idx, item in enumerate(comparable_candidates, start=1):
+            tie_reason = None
+            if score_counts.get(item["global_score"], 0) > 1:
+                tie_reason = (
+                    f"Empate en {item['global_score']:.2f} pts; ordenado deterministamente por "
+                    f"beneficiarios ({item['beneficiaries_count']:,}), presupuesto (S/ {float(item['estimated_budget_pen']):,.2f}) y codigo ({item['code']})."
+                )
+            ranked_projects.append({
+                "rank_position": idx,
+                **item,
+                "tie_break_reason": tie_reason,
+            })
+
+        mapped_projects = [item for item in ranked_projects if item["has_coordinates"]]
+        unmapped_projects = [item for item in ranked_projects if not item["has_coordinates"]]
+
+        return {
+            "is_recommendation": True,
+            "recommendation_notice": (
+                "Recomendacion tecnica preliminar de priorizacion basada en criterios vigentes (HU1.12). "
+                "No constituye aprobacion municipal ni reemplaza el dictamen formal de las autoridades."
+            ),
+            "criteria_version_id": active_crit_id,
+            "criteria_version_number": active_crit_num,
+            "total_projects": len(project_rows),
+            "comparable_count": len(ranked_projects),
+            "mapped_count": len(mapped_projects),
+            "unmapped_count": len(unmapped_projects),
+            "excluded_count": len(excluded_projects),
+            "ranked_projects": ranked_projects,
+            "mapped_projects": mapped_projects,
+            "unmapped_projects": unmapped_projects,
+            "excluded_projects": excluded_projects,
+            "generated_at": datetime.now(timezone.utc),
+        }
+
+    _GEO_LAYER_LABELS = {
+        "influence_area": "Area de influencia",
+        "beneficiary_coverage": "Cobertura de beneficiarios (agregada)",
+        "territorial_zone": "Zona territorial",
+    }
+
+    def register_geospatial_layer(
+        self,
+        project_id: UUID,
+        data: GeospatialLayerCreate,
+        actor_id: UUID,
+    ) -> dict[str, Any]:
+        """Registra una capa geoespacial versionada con geometria y fuente verificable (HU4.2)."""
+        project = self.get_project(project_id)
+        version_id = project["project_version_id"]
+        layer_id = uuid4()
+        now = datetime.now(timezone.utc)
+        gtype = data.geojson_data["type"] if data.geojson_data else None
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO project_geospatial_layers (
+                    id, project_version_id, layer_type, layer_name, meaning,
+                    source_name, data_origin, availability_status, geometry_type,
+                    geojson_data, aggregate_beneficiaries_count, created_by_user_id, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    layer_id,
+                    version_id,
+                    data.layer_type,
+                    data.layer_name,
+                    data.meaning,
+                    data.source_name,
+                    data.data_origin,
+                    data.availability_status,
+                    gtype,
+                    Jsonb(data.geojson_data) if data.geojson_data is not None else None,
+                    data.aggregate_beneficiaries_count,
+                    actor_id,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, 'GEOSPATIAL_LAYER_REGISTERED', 'project_version', %s, %s)
+                """,
+                (
+                    actor_id,
+                    version_id,
+                    Jsonb({
+                        "layer_id": str(layer_id),
+                        "layer_type": data.layer_type,
+                        "source_name": data.source_name,
+                        "availability_status": data.availability_status,
+                    }),
+                ),
+            )
+
+        return {
+            "layer_id": layer_id,
+            "project_version_id": version_id,
+            "layer_type": data.layer_type,
+            "layer_type_label": self._GEO_LAYER_LABELS.get(data.layer_type, data.layer_type),
+            "layer_name": data.layer_name,
+            "meaning": data.meaning,
+            "source_name": data.source_name,
+            "data_origin": data.data_origin,
+            "availability_status": data.availability_status,
+            "geometry_type": gtype,
+            "geojson_data": data.geojson_data,
+            "aggregate_beneficiaries_count": data.aggregate_beneficiaries_count,
+            "created_at": now,
+        }
+
+    def get_project_geospatial_layers(
+        self,
+        project_id: UUID,
+        version_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Consulta las capas geoespaciales de la version vigente sin inventar geometrias (HU4.2)."""
+        project = self.get_project(project_id)
+        target_version_id = version_id or project["project_version_id"]
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            v_row = conn.execute(
+                "SELECT id, version_number FROM project_versions WHERE id = %s AND project_id = %s",
+                (target_version_id, project_id),
+            ).fetchone()
+            if not v_row:
+                raise RecursoPMV1NoEncontradoError("Version del expediente no encontrada")
+
+            rows = conn.execute(
+                """
+                SELECT id AS layer_id, project_version_id, layer_type, layer_name,
+                       meaning, source_name, data_origin, availability_status,
+                       geometry_type, geojson_data, aggregate_beneficiaries_count, created_at
+                FROM project_geospatial_layers
+                WHERE project_version_id = %s
+                ORDER BY created_at ASC, layer_name ASC
+                """,
+                (target_version_id,),
+            ).fetchall()
+
+        layers: list[dict[str, Any]] = []
+        has_available = False
+        for r in rows:
+            is_avail = r["availability_status"] == "available" and r.get("geojson_data") is not None
+            if is_avail:
+                has_available = True
+            layers.append({
+                "layer_id": r["layer_id"],
+                "project_version_id": r["project_version_id"],
+                "layer_type": r["layer_type"],
+                "layer_type_label": self._GEO_LAYER_LABELS.get(r["layer_type"], r["layer_type"]),
+                "layer_name": r["layer_name"],
+                "meaning": r["meaning"],
+                "source_name": r["source_name"],
+                "data_origin": r["data_origin"],
+                "availability_status": r["availability_status"],
+                "geometry_type": r["geometry_type"] if is_avail else None,
+                "geojson_data": r["geojson_data"] if is_avail else None,
+                "aggregate_beneficiaries_count": r["aggregate_beneficiaries_count"],
+                "created_at": r["created_at"],
+            })
+
+        empty_msg = None
+        if not has_available:
+            empty_msg = (
+                "Sin geometria geoespacial verificada para esta version del expediente; "
+                "no se dibuja ningun area de influencia ficticia."
+            )
+
+        return {
+            "project_id": project_id,
+            "project_code": project["code"],
+            "project_version_id": target_version_id,
+            "version_number": v_row["version_number"],
+            "has_available_geometry": has_available,
+            "layers": layers,
+            "empty_message": empty_msg,
+            "privacy_notice": (
+                "Las capas geoespaciales muestran unicamente geometrias territoriales y conteos agregados; "
+                "no exponen datos personales de beneficiarios."
+            ),
+        }
+
+    def export_prioritization_ranking_pdf(self) -> tuple[bytes, str]:
+        """Exporta el informe preliminar de priorizacion en PDF en memoria (HU4.3).
+
+        Reutiliza exactamente get_project_map_ranking() y consulta en modo solo lectura
+        las evidencias normativas verificables y el estado de revision humana por version.
+        """
+        ranking = self.get_project_map_ranking()
+        all_items = list(ranking["ranked_projects"]) + list(ranking["excluded_projects"])
+        version_ids = [item["project_version_id"] for item in all_items]
+        project_ids = [item["project_id"] for item in all_items]
+
+        evidences_by_version: dict[str, list[dict[str, str]]] = {}
+        human_review_by_version: dict[str, dict[str, Any]] = {}
+
+        if version_ids:
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                norm_rows = conn.execute(
+                    """
+                    SELECT id, document_name, short_code, version, data_origin, in_force
+                    FROM normative_documents
+                    """
+                ).fetchall()
+
+                def _classify_zoning_source(
+                    source_doc: str, source_ver: str, source_loc: str, source_exc: str, limitations: str
+                ) -> tuple[str, str]:
+                    combined = f"{source_doc} {source_ver} {source_loc} {source_exc} {limitations}".lower()
+                    demo_markers = ("[demo]", "simulado", "simulated", "ficticio", "dato demo", "prueba")
+                    if any(m in combined for m in demo_markers):
+                        return "simulated", "Dato demo o simulado en zonificación; pendiente de cotejo con documento fuente."
+                    doc_norm = source_doc.strip().lower()
+                    for nr in norm_rows:
+                        n_name = str(nr.get("document_name") or "").strip().lower()
+                        n_code = str(nr.get("short_code") or "").strip().lower()
+                        if (n_name and (n_name in doc_norm or doc_norm in n_name)) or (n_code and n_code in doc_norm):
+                            origin = str(nr.get("data_origin") or "simulated")
+                            if origin in ("public", "official") and nr.get("in_force"):
+                                return "verified", f"Respaldado en corpus normativo ({nr['id']}, origen {origin})."
+                            return "simulated", f"Fuente normativa con origen '{origin}' o no vigente; pendiente de cotejo."
+                    return "unlinked", "Referencia de zonificación registrada sin documento fuente vinculado en corpus normativo; pendiente de cotejo."
+
+                # 1. Evidencia de zonificacion (HU1.11) contrastada contra corpus normativo
+                zoning_rows = conn.execute(
+                    """
+                    SELECT project_version_id, source_document, source_version, source_locator, source_excerpt, limitations
+                    FROM zoning_review_requests
+                    WHERE project_version_id = ANY(%s)
+                      AND NULLIF(btrim(source_document), '') IS NOT NULL
+                      AND NULLIF(btrim(source_version), '') IS NOT NULL
+                      AND NULLIF(btrim(source_locator), '') IS NOT NULL
+                      AND NULLIF(btrim(source_excerpt), '') IS NOT NULL
+                    ORDER BY requested_at DESC
+                    """,
+                    (version_ids,),
+                ).fetchall()
+                for zr in zoning_rows:
+                    vid = str(zr["project_version_id"])
+                    v_status, v_note = _classify_zoning_source(
+                        str(zr["source_document"]),
+                        str(zr["source_version"]),
+                        str(zr["source_locator"]),
+                        str(zr["source_excerpt"]),
+                        str(zr.get("limitations") or ""),
+                    )
+                    evidences_by_version.setdefault(vid, []).append({
+                        "document": str(zr["source_document"]),
+                        "version": str(zr["source_version"]),
+                        "locator": str(zr["source_locator"]),
+                        "excerpt": str(zr["source_excerpt"])[:180],
+                        "verification_status": v_status,
+                        "verification_note": v_note,
+                    })
+
+                # 2. Hallazgos legales con referencia precisa (HU2.2) - solo verificable si enlaza a normative_documents public/official
+                finding_rows = conn.execute(
+                    """
+                    SELECT f.project_id, f.project_version_id, f.normative_chunk_id,
+                           f.custom_article_or_section, f.title, f.notes,
+                           n.id AS norm_id, n.document_name AS norm_title, n.version AS norm_version,
+                           n.content AS norm_content, n.data_origin AS norm_origin, n.in_force AS norm_in_force
+                    FROM project_legal_findings f
+                    LEFT JOIN normative_documents n ON n.id = f.normative_chunk_id
+                    WHERE f.project_id = ANY(%s)
+                      AND f.has_precise_reference = TRUE
+                    ORDER BY f.created_at DESC
+                    """,
+                    (project_ids,),
+                ).fetchall()
+                latest_vid_by_pid = {str(it["project_id"]): str(it["project_version_id"]) for it in all_items}
+                for fr in finding_rows:
+                    vid = str(fr["project_version_id"] or latest_vid_by_pid.get(str(fr["project_id"]), ""))
+                    if not vid:
+                        continue
+                    has_linked_doc = bool(fr.get("normative_chunk_id") and fr.get("norm_id"))
+                    norm_origin = str(fr.get("norm_origin") or "")
+                    has_doc_fields = bool(
+                        str(fr.get("norm_title") or "").strip()
+                        and str(fr.get("norm_version") or "").strip()
+                        and str(fr.get("norm_content") or "").strip()
+                    )
+                    if not has_linked_doc or not has_doc_fields:
+                        v_status = "unlinked"
+                        v_note = "Referencia registrada sin documento fuente vinculado en normative_documents; pendiente de cotejo."
+                        doc_name = fr.get("title") or "Referencia legal sin documento fuente"
+                        doc_ver = "Sin versión verificada"
+                        locator = fr.get("custom_article_or_section") or "Sin localizador verificado"
+                        excerpt = fr.get("notes") or fr.get("title") or ""
+                    elif norm_origin not in ("public", "official"):
+                        v_status = "simulated"
+                        v_note = f"Documento vinculado con origen '{norm_origin}' (no oficial/público); pendiente de cotejo."
+                        doc_name = fr["norm_title"]
+                        doc_ver = fr["norm_version"]
+                        locator = fr.get("custom_article_or_section") or str(fr["norm_id"])
+                        excerpt = fr["norm_content"]
+                    else:
+                        v_status = "verified"
+                        v_note = f"Respaldado por {fr['norm_id']} (origen {norm_origin})."
+                        doc_name = fr["norm_title"]
+                        doc_ver = fr["norm_version"]
+                        locator = fr.get("custom_article_or_section") or str(fr["norm_id"])
+                        excerpt = fr["norm_content"]
+
+                    evidences_by_version.setdefault(vid, []).append({
+                        "document": str(doc_name),
+                        "version": str(doc_ver),
+                        "locator": str(locator),
+                        "excerpt": str(excerpt)[:180],
+                        "verification_status": v_status,
+                        "verification_note": v_note,
+                    })
+
+                # 3. Checkpoints HITL, aprobaciones humanas y estado legal por version
+                cp_rows = conn.execute(
+                    """
+                    SELECT DISTINCT ON (project_version_id)
+                           project_version_id, status, reason, resolved_at
+                    FROM evaluation_checkpoints
+                    WHERE project_version_id = ANY(%s)
+                    ORDER BY project_version_id, created_at DESC
+                    """,
+                    (version_ids,),
+                ).fetchall()
+                cp_by_vid = {str(r["project_version_id"]): r for r in cp_rows}
+
+                appr_rows = conn.execute(
+                    """
+                    SELECT DISTINCT ON (project_version_id)
+                           project_version_id, decision, justification, decided_at
+                    FROM human_approvals
+                    WHERE project_version_id = ANY(%s)
+                    ORDER BY project_version_id, decided_at DESC
+                    """,
+                    (version_ids,),
+                ).fetchall()
+                appr_by_vid = {str(r["project_version_id"]): r for r in appr_rows}
+
+                legal_rows = conn.execute(
+                    """
+                    SELECT DISTINCT ON (project_version_id)
+                           project_version_id, status, requires_human_review, has_legal_alert, is_resolved,
+                           verifiable_citations_count, unverifiable_citations_count
+                    FROM legal_assessments
+                    WHERE project_version_id = ANY(%s)
+                    ORDER BY project_version_id, evaluated_at DESC
+                    """,
+                    (version_ids,),
+                ).fetchall()
+                legal_by_vid = {str(r["project_version_id"]): r for r in legal_rows}
+
+                for item in all_items:
+                    vid = str(item["project_version_id"])
+                    parts: list[str] = []
+                    cp = cp_by_vid.get(vid)
+                    if cp:
+                        if cp["status"] == "pending_review":
+                            parts.append(f"Punto de control HITL pendiente de revision ({cp['reason']})")
+                        else:
+                            parts.append("Punto de control HITL resuelto")
+                    lg = legal_by_vid.get(vid)
+                    if lg:
+                        if (lg["status"] == "alerta_legal" or lg.get("has_legal_alert")) and not lg.get("is_resolved"):
+                            parts.append("Alerta legal activa sin resolver")
+                        elif lg.get("requires_human_review") or lg["status"] == "requires_review":
+                            parts.append("Revision juridica humana pendiente")
+                        else:
+                            parts.append(f"Evaluacion juridica {lg['status']} ({lg.get('verifiable_citations_count', 0)} cita(s) verificable(s))")
+                    else:
+                        parts.append("Evaluacion juridica pendiente")
+
+                    ap = appr_by_vid.get(vid)
+                    if ap:
+                        parts.append(f"Dictamen humano formal: {ap['decision']} ({ap['decided_at'].strftime('%Y-%m-%d')})")
+                    else:
+                        parts.append("Sin dictamen humano formal emitido (recomendacion no vinculante)")
+
+                    human_review_by_version[vid] = {"summary": " · ".join(parts)}
+
+        pdf_bytes = build_prioritization_pdf(
+            ranking=ranking,
+            evidences_by_version=evidences_by_version,
+            human_review_by_version=human_review_by_version,
+        )
+        ts = ranking["generated_at"].strftime("%Y%m%d-%H%M%S")
+        return pdf_bytes, f"siprim-ranking-priorizacion-{ts}.pdf"
 
     def verify_prioritization_allowed(self, project_id: UUID) -> dict[str, Any]:
         """Control de precondiciones para la futura priorización definitiva (HU2.3 / HU3.1 / HU1.12).

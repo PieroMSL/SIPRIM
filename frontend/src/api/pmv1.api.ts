@@ -1,4 +1,7 @@
 import type {
+  CheckpointDecisionRequest,
+  CheckpointDecisionResponse,
+  CheckpointDecisionsListResponse,
   CheckpointResponse,
   CheckpointResumeRequest,
   CheckpointResumeResponse,
@@ -49,6 +52,28 @@ export function getProjectCheckpoint(projectId: string): Promise<CheckpointRespo
   return apiFetch<CheckpointResponse | null>(`/api/v1/projects/${projectId}/checkpoint`, {
     auth: true,
   })
+}
+
+export function registerCheckpointDecision(
+  projectId: string,
+  payload: CheckpointDecisionRequest,
+  idempotencyKey: string,
+): Promise<CheckpointDecisionResponse> {
+  return apiFetch<CheckpointDecisionResponse>(`/api/v1/projects/${projectId}/checkpoint/decision`, {
+    method: 'POST',
+    auth: true,
+    idempotencyKey,
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getCheckpointDecisions(
+  projectId: string,
+): Promise<CheckpointDecisionsListResponse> {
+  return apiFetch<CheckpointDecisionsListResponse>(
+    `/api/v1/projects/${projectId}/checkpoint/decisions`,
+    { auth: true },
+  )
 }
 
 export function getProject(projectId: string): Promise<PMV1ProjectResponse> {

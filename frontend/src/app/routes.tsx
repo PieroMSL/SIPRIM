@@ -14,6 +14,9 @@ import { ProyectoDetallePage } from '../features/proyecto/ProyectoDetallePage'
 import { RegistrarPage } from '../features/registrar/RegistrarPage'
 import { PredictiveMLPage } from '../features/ml/PredictiveMLPage'
 import { PruebasMetricasPage } from '../features/pruebas/PruebasMetricasPage'
+import { RankingMapPage } from '../features/ranking/RankingMapPage'
+import { AdminRolesPage } from '../features/admin/AdminRolesPage'
+import { AuditHistoryPage } from '../features/audit/AuditHistoryPage'
 
 export function AppRoutes() {
   return (
@@ -25,10 +28,10 @@ export function AppRoutes() {
       <Route element={<ProtectedRoute />}>
         <Route element={<Layout />}>
           <Route index element={<HomePage />} />
-          <Route path="registrar" element={<RegistrarPage />} />
           <Route path="consultar" element={<ConsultarPage />} />
           <Route path="integracion-ia" element={<GeminiIntegrationPage />} />
           <Route element={<RoleRoute anyOf={['PLANNER', 'ADMIN']} />}>
+            <Route path="registrar" element={<RegistrarPage />} />
             <Route path="prediccion-ml" element={<PredictiveMLPage />} />
           </Route>
           <Route path="pruebas-metricas" element={<PruebasMetricasPage />} />
@@ -42,8 +45,17 @@ export function AppRoutes() {
             <Route path="normativa" element={<NormativaPage />} />
           </Route>
 
+          <Route element={<RoleRoute anyOf={['MAYOR', 'ADMIN', 'PLANNER']} />}>
+            <Route path="ranking-mapa" element={<RankingMapPage />} />
+          </Route>
+
+          <Route element={<RoleRoute anyOf={['AUDITOR', 'ADMIN']} />}>
+            <Route path="auditoria/historial" element={<AuditHistoryPage />} />
+          </Route>
+
           <Route element={<RoleRoute anyOf={['ADMIN']} />}>
             <Route path="proyectos/:projectId/aprobacion" element={<AprobacionPage />} />
+            <Route path="admin/roles" element={<AdminRolesPage />} />
           </Route>
         </Route>
       </Route>

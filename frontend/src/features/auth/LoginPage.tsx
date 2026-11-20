@@ -6,7 +6,7 @@ import { useApiHealth } from '../../hooks/useApiHealth'
 import { useAuth } from './AuthContext'
 
 export function LoginPage() {
-  const { login } = useAuth()
+  const { login, authNotice, clearAuthNotice } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const apiOnline = useApiHealth()
@@ -20,6 +20,7 @@ export function LoginPage() {
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault()
     setError(null)
+    clearAuthNotice()
     setLoading(true)
 
     try {
@@ -57,6 +58,7 @@ export function LoginPage() {
         )}
 
         <form className="login-form" onSubmit={onSubmit} noValidate>
+          {!error && authNotice && <Alert variant="error">{authNotice}</Alert>}
           {error && <Alert variant="error">{error}</Alert>}
 
           <FormField

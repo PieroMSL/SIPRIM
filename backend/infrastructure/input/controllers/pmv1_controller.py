@@ -1,13 +1,20 @@
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response, status
 
 from backend.application.dto.evaluacion_ia_dto import DictamenIAResponse
 from backend.application.dto.pmv1_dto import (
+    AdminUsersListResponse,
+    AuditProjectSummaryListResponse,
+    CheckpointDecisionRequest,
+    CheckpointDecisionResponse,
+    CheckpointDecisionsListResponse,
     CheckpointResponse,
     CheckpointResumeRequest,
     CheckpointResumeResponse,
+    CurrentUserMeResponse,
+    DecisionIntegrityVerificationResponse,
     EvaluationAccepted,
     EvaluationCreate,
     EvaluationResponse,
@@ -28,10 +35,17 @@ from backend.application.dto.pmv1_dto import (
     PMV1ProjectCreate,
     PMV1ProjectResponse,
     PMV1ValidationResponse,
+    GeospatialLayerCreate,
+    GeospatialLayerItem,
+    ProjectGeospatialLayersResponse,
+    ProjectHistoryResponse,
+    ProjectMapRankingResponse,
     EnvironmentalAssessmentResponse,
     SocialAccessibilityResponse,
     TechnicalFeasibilityResponse,
     UnifiedAssessmentSummaryResponse,
+    UserRolesUpdateRequest,
+    UserRolesUpdateResponse,
     ZoningPrecheckResponse,
 )
 from backend.application.services.pmv1_services import AuthService, PlatformService
@@ -47,12 +61,17 @@ from backend.domain.exceptions.pmv1_exceptions import ExpedientePMV1IncompletoEr
 from backend.domain.ports.ia_service_port import IAServicePort
 from backend.infrastructure.config.dependencies import (
     get_auth_service,
+    get_current_user,
     get_ia_service,
     get_platform_service,
     require_admin,
+    require_auditor,
     require_legal_advisor,
     require_legal_or_planner,
     require_planner,
+    require_planner_or_manager,
+    require_planning_manager,
+    require_ranking_authority,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["PMV1 oficial"])
@@ -64,6 +83,88 @@ def login(
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> dict[str, Any]:
     return service.login(data.email, data.password)
+
+
+@router.get(
+    "/audit/projects",
+    response_model=AuditProjectSummaryListResponse,
+    summary="Lista expedientes disponibles para consulta de auditoría en solo lectura (HU5.3)",
+)
+def list_auditable_projects(
+    _: Annotated[dict[str, Any], Depends(require_auditor)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.list_auditable_projects()
+
+
+@router.get(
+    "/projects/{project_id}/history",
+    response_model=ProjectHistoryResponse,
+    summary="Consulta el historial cronológico completo de un expediente en solo lectura (HU5.3)",
+)
+def get_project_history(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_auditor)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.get_project_history(project_id)
+
+
+@router.get(
+    "/projects/{project_id}/versions/{version_id}/decisions/{decision_id}/verify-integrity",
+    response_model=DecisionIntegrityVerificationResponse,
+    summary="Verifica en vivo y en solo lectura la integridad SHA-256 de una decisión (HU5.4)",
+)
+def verify_decision_integrity(
+    project_id: Annotated[UUID, Path()],
+    version_id: Annotated[UUID, Path()],
+    decision_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_auditor)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.verify_decision_integrity(
+        project_id=project_id,
+        project_version_id=version_id,
+        decision_id=decision_id,
+    )
+
+
+@router.get("/auth/me", response_model=CurrentUserMeResponse)
+def auth_me(
+    user: Annotated[dict[str, Any], Depends(get_current_user)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> dict[str, Any]:
+    return service.get_current_user_profile(UUID(user["sub"]))
+
+
+@router.get(
+    "/admin/users",
+    response_model=AdminUsersListResponse,
+    summary="Lista usuarios municipales y catalogo de roles permitidos (HU5.1)",
+)
+def list_admin_users(
+    _: Annotated[dict[str, Any], Depends(require_admin)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> dict[str, Any]:
+    return service.list_users_and_roles()
+
+
+@router.put(
+    "/admin/users/{user_id}/roles",
+    response_model=UserRolesUpdateResponse,
+    summary="Asigna, modifica o revoca roles de un usuario municipal (HU5.1)",
+)
+def update_admin_user_roles(
+    user_id: Annotated[UUID, Path()],
+    data: UserRolesUpdateRequest,
+    actor: Annotated[dict[str, Any], Depends(require_admin)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> dict[str, Any]:
+    return service.update_user_roles(
+        target_user_id=user_id,
+        new_roles=data.roles,
+        actor_roles=list(actor.get("roles", [])),
+    )
 
 
 @router.post(
@@ -86,6 +187,41 @@ def get_project_by_code(
     return service.get_project_by_code(code)
 
 
+@router.get(
+    "/projects/ranking",
+    response_model=ProjectMapRankingResponse,
+    summary="Obtener ranking determinista de proyectos priorizados para mapa (HU4.1)",
+    tags=["Priorizacion y Mapa"],
+)
+def get_project_map_ranking(
+    _: Annotated[dict[str, Any], Depends(require_ranking_authority)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.get_project_map_ranking()
+
+
+@router.get(
+    "/projects/ranking/pdf",
+    summary="Exportar informe preliminar de priorizacion en PDF (HU4.3)",
+    tags=["Priorizacion y Mapa"],
+    responses={
+        200: {"content": {"application/pdf": {}}},
+    },
+)
+def export_project_map_ranking_pdf(
+    _: Annotated[dict[str, Any], Depends(require_ranking_authority)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> Response:
+    pdf_bytes, filename = service.export_prioritization_ranking_pdf()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
 @router.get("/projects/{project_id}", response_model=PMV1ProjectResponse)
 def get_project(
     project_id: Annotated[UUID, Path()],
@@ -93,6 +229,41 @@ def get_project(
     service: Annotated[PlatformService, Depends(get_platform_service)],
 ) -> dict[str, Any]:
     return service.get_project(project_id)
+
+
+@router.get(
+    "/projects/{project_id}/geospatial-layers",
+    response_model=ProjectGeospatialLayersResponse,
+    summary="Consultar capas geoespaciales versionadas de un expediente (HU4.2)",
+    tags=["Priorizacion y Mapa"],
+)
+def get_project_geospatial_layers(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_ranking_authority)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.get_project_geospatial_layers(project_id=project_id, version_id=version_id)
+
+
+@router.post(
+    "/projects/{project_id}/geospatial-layers",
+    response_model=GeospatialLayerItem,
+    status_code=status.HTTP_201_CREATED,
+    summary="Registrar capa geoespacial verificable para la version vigente (HU4.2)",
+    tags=["Priorizacion y Mapa"],
+)
+def register_geospatial_layer(
+    project_id: Annotated[UUID, Path()],
+    data: GeospatialLayerCreate,
+    user: Annotated[dict[str, Any], Depends(require_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.register_geospatial_layer(
+        project_id=project_id,
+        data=data,
+        actor_id=UUID(user["sub"]),
+    )
 
 
 @router.get(
@@ -109,6 +280,59 @@ def get_project_checkpoint(
 
 
 @router.post(
+    "/projects/{project_id}/checkpoint/decision",
+    response_model=CheckpointDecisionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Registra una decisión autenticada con huella SHA-256 sobre un checkpoint pendiente (HU3.3)",
+)
+def register_checkpoint_decision(
+    project_id: Annotated[UUID, Path()],
+    payload: CheckpointDecisionRequest,
+    user: Annotated[dict[str, Any], Depends(require_planning_manager)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    idempotency_key: Annotated[
+        str, Header(alias="Idempotency-Key", min_length=1, max_length=128)
+    ],
+) -> dict[str, Any]:
+    actor_id = UUID(user["sub"])
+    if isinstance(auth_service, AuthService):
+        profile = auth_service.get_current_user_profile(actor_id)
+        actor_name = profile.get("full_name")
+        actor_email = profile.get("email")
+    elif hasattr(auth_service, "get_current_user_profile"):
+        profile = auth_service.get_current_user_profile(actor_id)
+        actor_name = profile.get("full_name")
+        actor_email = profile.get("email")
+    else:
+        actor_name = user.get("full_name")
+        actor_email = user.get("email")
+    return service.register_checkpoint_decision(
+        project_id=project_id,
+        actor_id=actor_id,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        decision=payload.decision,
+        justification=payload.justification,
+        conditions=payload.conditions,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/checkpoint/decisions",
+    response_model=CheckpointDecisionsListResponse,
+    summary="Consulta y verifica la huella SHA-256 de decisiones de checkpoint de la versión vigente (HU3.3)",
+)
+def list_checkpoint_decisions(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(get_current_user)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.list_checkpoint_decisions(project_id)
+
+
+@router.post(
     "/projects/{project_id}/checkpoint/resume",
     response_model=CheckpointResumeResponse,
     status_code=status.HTTP_200_OK,
@@ -117,7 +341,7 @@ def get_project_checkpoint(
 def resume_project_checkpoint(
     project_id: Annotated[UUID, Path()],
     payload: CheckpointResumeRequest,
-    user: Annotated[dict[str, Any], Depends(require_planner)],
+    user: Annotated[dict[str, Any], Depends(require_planner_or_manager)],
     service: Annotated[PlatformService, Depends(get_platform_service)],
     idempotency_key: Annotated[
         str, Header(alias="Idempotency-Key", min_length=1, max_length=128)

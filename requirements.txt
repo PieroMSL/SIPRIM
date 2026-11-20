@@ -11,3 +11,5 @@ pytest>=8.3,<9.0
 httpx>=0.28,<1.0
 google-genai>=1.75,<2.0
 langgraph>=0.6,<1.0
+
+reportlab>=4.2,<5.0

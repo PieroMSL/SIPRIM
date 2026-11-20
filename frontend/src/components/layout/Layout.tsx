@@ -9,8 +9,11 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
 function formatRoles(roles: string[]): string {
   const labels: Record<string, string> = {
     PLANNER: 'Planificador',
+    PLANNING_MANAGER: 'Gerente de Planeamiento',
     LEGAL_ADVISOR: 'Asesor jurídico',
     ADMIN: 'Administrador',
+    MAYOR: 'Alcalde',
+    AUDITOR: 'Auditor / Contraloría',
     SUPERADMIN: 'Superadministrador',
   }
   return roles.map((r) => labels[r] ?? r).join(' · ')
@@ -18,7 +21,7 @@ function formatRoles(roles: string[]): string {
 
 export function Layout() {
   const apiOnline = useApiHealth()
-  const { user, logout, hasRole } = useAuth()
+  const { user, logout, hasRole, roleUpdateNotice, clearRoleUpdateNotice } = useAuth()
   const navigate = useNavigate()
 
   const handleLogout = () => {
@@ -45,9 +48,11 @@ export function Layout() {
             <NavLink to="/" end className={navLinkClass}>
               Inicio
             </NavLink>
-            <NavLink to="/registrar" className={navLinkClass}>
-              Cargar expediente
-            </NavLink>
+            {(hasRole('PLANNER') || hasRole('ADMIN')) && (
+              <NavLink to="/registrar" className={navLinkClass}>
+                Cargar expediente
+              </NavLink>
+            )}
             <NavLink to="/consultar" className={navLinkClass}>
               Consultar
             </NavLink>
@@ -55,12 +60,27 @@ export function Layout() {
               Integración IA
             </NavLink>
             {(hasRole('PLANNER') || hasRole('ADMIN')) && <NavLink to="/prediccion-ml" className={navLinkClass}>Predicciones ML</NavLink>}
+            {(hasRole('MAYOR') || hasRole('ADMIN') || hasRole('PLANNER')) && (
+              <NavLink to="/ranking-mapa" className={navLinkClass}>
+                Ranking y Mapa
+              </NavLink>
+            )}
             <NavLink to="/pruebas-metricas" className={navLinkClass}>
               Pruebas y Métricas
             </NavLink>
             {hasRole('LEGAL_ADVISOR') && (
               <NavLink to="/normativa" className={navLinkClass}>
                 Normativa
+              </NavLink>
+            )}
+            {(hasRole('AUDITOR') || hasRole('ADMIN')) && (
+              <NavLink to="/auditoria/historial" className={navLinkClass}>
+                Auditoría e historial
+              </NavLink>
+            )}
+            {hasRole('ADMIN') && (
+              <NavLink to="/admin/roles" className={navLinkClass}>
+                Roles y usuarios
               </NavLink>
             )}
           </nav>
@@ -82,6 +102,40 @@ export function Layout() {
       </header>
 
       <main className="app-main">
+        {roleUpdateNotice && (
+          <div
+            role="status"
+            style={{
+              maxWidth: '1200px',
+              margin: '0 auto 1rem',
+              padding: '0.75rem 1rem',
+              borderRadius: '8px',
+              background: '#fef3c7',
+              border: '1px solid #f59e0b',
+              color: '#92400e',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: '0.75rem',
+            }}
+          >
+            <span>{roleUpdateNotice}</span>
+            <button
+              type="button"
+              onClick={clearRoleUpdateNotice}
+              style={{
+                background: 'transparent',
+                border: '1px solid #d97706',
+                borderRadius: '6px',
+                padding: '0.25rem 0.6rem',
+                color: '#92400e',
+                cursor: 'pointer',
+              }}
+            >
+              Entendido
+            </button>
+          </div>
+        )}
         <Outlet />
       </main>
 

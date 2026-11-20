@@ -12,11 +12,13 @@ import {
   getEvaluation,
   getHumanApproval,
   evaluateTechnicalFeasibility,
+  getCheckpointDecisions,
   getTechnicalFeasibility,
   getUnifiedAssessmentSummary,
   getPertEstimate,
   getProject,
   getProjectCheckpoint,
+  registerCheckpointDecision,
   resumeProjectCheckpoint,
   getSocialAccessibility,
   registerPertEstimate,
@@ -26,6 +28,7 @@ import {
 } from '../../api/pmv1.api'
 import { useAuth } from '../auth/AuthContext'
 import type {
+  CheckpointDecisionResponse,
   CheckpointResponse,
   EvaluationResponse,
   HumanApprovalStatusResponse,
@@ -59,6 +62,13 @@ export function ProyectoDetallePage() {
   const [zoning, setZoning] = useState<ZoningPrecheckResponse | null>(null)
   const [approval, setApproval] = useState<HumanApprovalStatusResponse | null>(null)
   const [checkpoint, setCheckpoint] = useState<CheckpointResponse | null>(null)
+  const [checkpointDecisions, setCheckpointDecisions] = useState<CheckpointDecisionResponse[]>([])
+  const [decisionChoice, setDecisionChoice] = useState<'approve_continue' | 'request_correction'>('approve_continue')
+  const [decisionJustification, setDecisionJustification] = useState('')
+  const [decisionConditions, setDecisionConditions] = useState('')
+  const [submittingDecision, setSubmittingDecision] = useState(false)
+  const [decisionSuccess, setDecisionSuccess] = useState<string | null>(null)
+  const [verifyingDecisions, setVerifyingDecisions] = useState(false)
   const [resumeJustification, setResumeJustification] = useState('')
   const [resumeConditions, setResumeConditions] = useState('')
   const [resumingCheckpoint, setResumingCheckpoint] = useState(false)
@@ -120,11 +130,22 @@ export function ProyectoDetallePage() {
     }
   }, [projectId])
 
+  const loadCheckpointDecisions = useCallback(async () => {
+    if (!projectId) return
+    try {
+      const data = await getCheckpointDecisions(projectId)
+      setCheckpointDecisions(data.decisions)
+    } catch {
+      /* sin decisiones o sin acceso */
+    }
+  }, [projectId])
+
   const loadCheckpoint = useCallback(async () => {
     if (!projectId) return
     try {
       const data = await getProjectCheckpoint(projectId)
       setCheckpoint(data)
+      void loadCheckpointDecisions()
       if (data?.evaluation_id) {
         try {
           const persistedEvaluation = await getEvaluation(data.evaluation_id)
@@ -142,7 +163,7 @@ export function ProyectoDetallePage() {
     } catch {
       /* opcional */
     }
-  }, [projectId])
+  }, [projectId, loadCheckpointDecisions])
 
   const loadSocialAssessment = useCallback(async () => {
     if (!projectId) return
@@ -497,6 +518,50 @@ export function ProyectoDetallePage() {
   // HU3.2: Garantizar aislamiento estricto por versión del expediente.
   // Un punto de control de una versión anterior u obsoleta no debe presentarse como activo en la versión vigente.
   const rawCheckpoint = checkpoint ?? project?.checkpoint ?? approval?.checkpoint ?? null
+  const handleRegisterCheckpointDecision = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!projectId || decisionJustification.trim().length < 5) return
+    setSubmittingDecision(true)
+    setError(null)
+    setDecisionSuccess(null)
+    try {
+      const res = await registerCheckpointDecision(
+        projectId,
+        {
+          decision: decisionChoice,
+          justification: decisionJustification.trim(),
+          conditions: decisionConditions.trim() || undefined,
+        },
+        newIdempotencyKey('cp-decision'),
+      )
+      setDecisionSuccess(
+        res.decision === 'approve_continue'
+          ? 'Constancia registrada: aprobación de continuación con huella SHA-256 verificada.'
+          : 'Constancia registrada: corrección solicitada. La pausa del expediente se mantiene activa.',
+      )
+      setDecisionJustification('')
+      setDecisionConditions('')
+      await loadCheckpointDecisions()
+      await loadCheckpoint()
+      await loadProject()
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'No se pudo registrar la constancia de decisión.',
+      )
+    } finally {
+      setSubmittingDecision(false)
+    }
+  }
+
+  const handleVerifyDecisions = async () => {
+    setVerifyingDecisions(true)
+    try {
+      await loadCheckpointDecisions()
+    } finally {
+      setVerifyingDecisions(false)
+    }
+  }
+
   const handleResumeCheckpoint = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!projectId || resumeJustification.trim().length < 5) return
@@ -686,68 +751,163 @@ export function ProyectoDetallePage() {
                   <strong>Control gerencial (CA-HU3.2-01 / CA-HU3.2-02 / CA-HU3.4-01):</strong> El procesamiento automático ha sido detenido en este punto de control persistente. La evaluación no concluye ni se da por aprobada automáticamente. Un responsable facultado (Gerente de Planeamiento) puede autorizar la continuación del procesamiento desde este estado conservado sin repetir etapas completadas.
                 </p>
 
-                {/* Formulario de Reanudación de Evaluación desde Checkpoint (HU3.4) */}
-                {(hasRole('PLANNER') || hasRole('ADMIN')) ? (
-                <form
-                  onSubmit={handleResumeCheckpoint}
-                  style={{
-                    marginTop: '1rem',
-                    padding: '1rem',
-                    background: '#ffffff',
-                    borderRadius: '8px',
-                    border: '1px solid #f87171',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '0.75rem',
-                  }}
-                  data-testid="checkpoint-resume-form"
-                >
-                  <h4 style={{ margin: 0, color: '#991b1b', fontSize: '0.95rem', fontWeight: 700 }}>
-                    Autorizar Continuación y Reanudar Evaluación (HU3.4)
-                  </h4>
-                  <p style={{ margin: 0, fontSize: '0.8rem', color: '#4b5563' }}>
-                    Como Gerente de Planeamiento o Administrador, justifique la autorización para levantar la pausa y reanudar el flujo desde el estado conservado.
-                  </p>
-                  <div>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
-                      Justificación / Sustento de la decisión (mínimo 5 caracteres) *
-                    </label>
-                    <textarea
-                      rows={2}
-                      className="form-field-input"
-                      style={{ width: '100%', fontSize: '0.85rem' }}
-                      placeholder="Ingrese el sustento técnico y legal que justifica la continuación del expediente..."
-                      value={resumeJustification}
-                      onChange={(e) => setResumeJustification(e.target.value)}
-                      required
-                    />
+                {/* Formulario de Decisión y Constancia SHA-256 (HU3.3) */}
+                {(hasRole('PLANNING_MANAGER') || hasRole('ADMIN')) ? (
+                  <div style={{ display: 'grid', gap: '0.85rem', marginTop: '1rem' }}>
+                    <form
+                      onSubmit={handleRegisterCheckpointDecision}
+                      style={{
+                        padding: '1rem',
+                        background: '#ffffff',
+                        borderRadius: '8px',
+                        border: '1px solid #cbd5e1',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.75rem',
+                      }}
+                      data-testid="checkpoint-decision-form"
+                    >
+                      <h4 style={{ margin: 0, color: '#0f172a', fontSize: '0.95rem', fontWeight: 700 }}>
+                        Registrar decisión autenticada del punto de control (Versión v{project?.version_number ?? 1})
+                      </h4>
+                      <p style={{ margin: 0, fontSize: '0.82rem', color: '#475569' }}>
+                        La decisión genera una constancia de integridad SHA-256 en el servidor. Solicitar una corrección mantiene la pausa activa y el dictamen final bloqueado.
+                      </p>
+                      {decisionSuccess && <Alert variant="success">{decisionSuccess}</Alert>}
+                      <div>
+                        <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
+                          Decisión sobre la pausa *
+                        </label>
+                        <select
+                          className="form-field-input"
+                          style={{ width: '100%', fontSize: '0.85rem' }}
+                          value={decisionChoice}
+                          onChange={(e) =>
+                            setDecisionChoice(e.target.value as 'approve_continue' | 'request_correction')
+                          }
+                        >
+                          <option value="approve_continue">
+                            Aprobar continuación de evaluación
+                          </option>
+                          <option value="request_correction">
+                            Solicitar corrección (mantener pausa)
+                          </option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
+                          Fundamento de la decisión (mínimo 5 caracteres) *
+                        </label>
+                        <textarea
+                          rows={2}
+                          className="form-field-input"
+                          style={{ width: '100%', fontSize: '0.85rem' }}
+                          placeholder="Sustento técnico o normativo de la decisión sobre este punto de control..."
+                          value={decisionJustification}
+                          onChange={(e) => setDecisionJustification(e.target.value)}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
+                          {decisionChoice === 'request_correction'
+                            ? 'Corrección u observaciones requeridas (obligatorio) *'
+                            : 'Condiciones u observaciones operativas (opcional)'}
+                        </label>
+                        <input
+                          type="text"
+                          className="form-field-input"
+                          style={{ width: '100%', fontSize: '0.85rem' }}
+                          placeholder={
+                            decisionChoice === 'request_correction'
+                              ? 'Detalle las correcciones o documentos de subsanación requeridos...'
+                              : 'Condiciones técnicas impuestas para continuar...'
+                          }
+                          value={decisionConditions}
+                          onChange={(e) => setDecisionConditions(e.target.value)}
+                          required={decisionChoice === 'request_correction'}
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
+                        disabled={
+                          submittingDecision ||
+                          decisionJustification.trim().length < 5 ||
+                          (decisionChoice === 'request_correction' && !decisionConditions.trim())
+                        }
+                        style={{ alignSelf: 'flex-start' }}
+                      >
+                        {submittingDecision ? 'Registrando constancia...' : 'Registrar constancia de decisión'}
+                      </button>
+                    </form>
+
+                    {checkpointDecisions.some((d) => d.decision === 'approve_continue' && d.checkpoint_id === activeCheckpoint?.checkpoint_id) ? (
+                      <form
+                        onSubmit={handleResumeCheckpoint}
+                        style={{
+                          padding: '1rem',
+                          background: '#ffffff',
+                          borderRadius: '8px',
+                          border: '1px solid #f87171',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '0.75rem',
+                        }}
+                        data-testid="checkpoint-resume-form"
+                      >
+                        <h4 style={{ margin: 0, color: '#991b1b', fontSize: '0.95rem', fontWeight: 700 }}>
+                          Reanudar evaluación desde el punto de control (HU3.4)
+                        </h4>
+                        <p style={{ margin: 0, fontSize: '0.8rem', color: '#4b5563' }}>
+                          Existe una aprobación de continuación registrada para esta versión. Puede reanudar el procesamiento conservando los resultados previos.
+                        </p>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
+                            Justificación de reanudación (mínimo 5 caracteres) *
+                          </label>
+                          <textarea
+                            rows={2}
+                            className="form-field-input"
+                            style={{ width: '100%', fontSize: '0.85rem' }}
+                            placeholder="Confirme el motivo operativo de reanudación..."
+                            value={resumeJustification}
+                            onChange={(e) => setResumeJustification(e.target.value)}
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
+                            Condiciones operativas (opcional)
+                          </label>
+                          <input
+                            type="text"
+                            className="form-field-input"
+                            style={{ width: '100%', fontSize: '0.85rem' }}
+                            placeholder="Condiciones técnicas..."
+                            value={resumeConditions}
+                            onChange={(e) => setResumeConditions(e.target.value)}
+                          />
+                        </div>
+                        <button
+                          type="submit"
+                          className="btn btn-primary"
+                          disabled={resumingCheckpoint || resumeJustification.trim().length < 5}
+                          style={{ alignSelf: 'flex-start', background: '#b91c1c', borderColor: '#991b1b' }}
+                        >
+                          {resumingCheckpoint ? 'Reanudando evaluación...' : 'Autorizar y reanudar evaluación'}
+                        </button>
+                      </form>
+                    ) : (
+                      <p className="checkpoint-footer-notice" style={{ margin: 0 }}>
+                        Para reanudar la evaluación (HU3.4), primero debe registrarse una constancia de <strong>Aprobación para continuar</strong> sobre este punto de control y versión.
+                      </p>
+                    )}
                   </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
-                      Condiciones u observaciones operativas (opcional)
-                    </label>
-                    <input
-                      type="text"
-                      className="form-field-input"
-                      style={{ width: '100%', fontSize: '0.85rem' }}
-                      placeholder="Condiciones técnicas impuestas (ej. monitoreo de faja marginal, plan de contingencia)..."
-                      value={resumeConditions}
-                      onChange={(e) => setResumeConditions(e.target.value)}
-                    />
-                  </div>
-                  <button
-                    type="submit"
-                    className="btn btn-primary"
-                    disabled={resumingCheckpoint || resumeJustification.trim().length < 5}
-                    style={{ alignSelf: 'flex-start', background: '#b91c1c', borderColor: '#991b1b' }}
-                  >
-                    {resumingCheckpoint ? 'Reanudando evaluación...' : 'Autorizar y reanudar evaluación'}
-                  </button>
-                </form>
                 ) : (
                   <p className="checkpoint-footer-notice">
-                    Su perfil puede consultar la pausa, pero no está autorizado para reanudarla.
-                    Se requiere un Gerente de Planeamiento o Administrador (CA-HU3.4-02).
+                    Su perfil puede consultar la pausa, pero no está autorizado para registrar decisiones o reanudar.
+                    Se requiere el rol Gerente de Planeamiento o Administrador.
                   </p>
                 )}
               </div>
@@ -800,6 +960,119 @@ export function ProyectoDetallePage() {
 
           {resumeSuccess && (
             <Alert variant="success">{resumeSuccess}</Alert>
+          )}
+
+          {checkpointDecisions.length > 0 && (
+            <section
+              className="flow-panel"
+              data-testid="checkpoint-decisions-panel"
+              style={{
+                background: '#f8fafc',
+                borderColor: '#cbd5e1',
+                padding: '1.15rem',
+                marginBottom: '1.5rem',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '0.5rem',
+                  marginBottom: '0.75rem',
+                }}
+              >
+                <div>
+                  <h3 style={{ margin: 0, color: '#0f172a', fontSize: '1.05rem' }}>
+                    Constancia de decisión e integridad SHA-256 (Versión v{project?.version_number ?? 1})
+                  </h3>
+                  <p style={{ margin: '0.2rem 0 0', fontSize: '0.82rem', color: '#475569' }}>
+                    {checkpointDecisions[0].prototype_notice}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={verifyingDecisions}
+                  onClick={() => void handleVerifyDecisions()}
+                >
+                  {verifyingDecisions ? 'Verificando…' : 'Verificar integridad'}
+                </button>
+              </div>
+
+              <div style={{ display: 'grid', gap: '0.75rem' }}>
+                {checkpointDecisions.map((d) => {
+                  const isValid = d.verification_status === 'valid'
+                  return (
+                    <article
+                      key={d.decision_id}
+                      style={{
+                        background: '#ffffff',
+                        border: `1px solid ${isValid ? '#86efac' : '#fca5a5'}`,
+                        borderRadius: '8px',
+                        padding: '0.9rem',
+                        display: 'grid',
+                        gap: '0.45rem',
+                        fontSize: '0.85rem',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          flexWrap: 'wrap',
+                          gap: '0.5rem',
+                        }}
+                      >
+                        <strong style={{ color: '#0f172a' }}>{d.decision_label}</strong>
+                        <span
+                          style={{
+                            padding: '0.2rem 0.6rem',
+                            borderRadius: '999px',
+                            fontSize: '0.78rem',
+                            fontWeight: 700,
+                            background: isValid ? '#dcfce7' : '#fee2e2',
+                            color: isValid ? '#166534' : '#991b1b',
+                          }}
+                        >
+                          {d.verification_label}
+                        </span>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.5rem' }}>
+                        <div>
+                          <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>RESPONSABLE</span>
+                          <span>{d.decided_by_name || d.decided_by_email || d.decided_by_user_id}</span>
+                        </div>
+                        <div>
+                          <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>FECHA Y HORA</span>
+                          <span>{formatDate(d.decided_at)}</span>
+                        </div>
+                        <div>
+                          <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>VERSIÓN REVISADA</span>
+                          <span>v{d.version_number}</span>
+                        </div>
+                      </div>
+                      <div>
+                        <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>FUNDAMENTO</span>
+                        <span>{d.justification}</span>
+                      </div>
+                      {d.conditions && (
+                        <div>
+                          <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>CONDICIONES / CORRECCIÓN</span>
+                          <span>{d.conditions}</span>
+                        </div>
+                      )}
+                      <div>
+                        <span style={{ color: '#64748b', fontSize: '0.75rem', display: 'block' }}>HUELLA SHA-256 ALMACENADA</span>
+                        <code style={{ fontSize: '0.76rem', wordBreak: 'break-all' }}>{d.integrity_hash_sha256}</code>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
           )}
 
           {physicalExpediente && (

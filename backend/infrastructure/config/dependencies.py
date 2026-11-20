@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -204,7 +205,10 @@ def get_current_user(
         from backend.domain.exceptions.pmv1_exceptions import CredencialesInvalidasError
 
         raise CredencialesInvalidasError("Autenticacion requerida")
-    return auth.decode(credentials.credentials)
+    claims = auth.decode(credentials.credentials)
+    if isinstance(auth, AuthService) or hasattr(auth, "get_active_user_roles"):
+        claims["roles"] = auth.get_active_user_roles(UUID(claims["sub"]))
+    return claims
 
 
 def _user_roles(user: dict[str, Any]) -> list[str]:
@@ -245,7 +249,56 @@ def require_legal_or_planner(
     user: Annotated[dict[str, Any], Depends(get_current_user)],
 ) -> dict[str, Any]:
     roles = _user_roles(user)
-    if _is_superadmin(roles) or "LEGAL_ADVISOR" in roles or "PLANNER" in roles or "ADMIN" in roles:
+    if (
+        _is_superadmin(roles)
+        or "LEGAL_ADVISOR" in roles
+        or "PLANNER" in roles
+        or "PLANNING_MANAGER" in roles
+        or "ADMIN" in roles
+    ):
         return user
-    raise AccesoDenegadoError("Se requiere rol LEGAL_ADVISOR o PLANNER")
+    raise AccesoDenegadoError("Se requiere rol LEGAL_ADVISOR, PLANNER o PLANNING_MANAGER")
 
+
+def require_planning_manager(
+    user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    """Autoriza decisiones HITL sobre checkpoints (HU3.3) al Gerente de Planeamiento o Administrador."""
+    roles = _user_roles(user)
+    if _is_superadmin(roles) or "PLANNING_MANAGER" in roles or "ADMIN" in roles:
+        return user
+    raise AccesoDenegadoError("Se requiere el rol PLANNING_MANAGER o ADMIN")
+
+
+def require_planner_or_manager(
+    user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    roles = _user_roles(user)
+    if (
+        _is_superadmin(roles)
+        or "PLANNER" in roles
+        or "PLANNING_MANAGER" in roles
+        or "ADMIN" in roles
+    ):
+        return user
+    raise AccesoDenegadoError("Se requiere el rol PLANNER, PLANNING_MANAGER o ADMIN")
+
+
+def require_ranking_authority(
+    user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    """Autoriza la consulta del ranking en mapa (HU4.1) a Alcalde, Gerencia o Planificacion."""
+    roles = _user_roles(user)
+    if _is_superadmin(roles) or "MAYOR" in roles or "ADMIN" in roles or "PLANNER" in roles:
+        return user
+    raise AccesoDenegadoError("Se requiere el rol MAYOR, ADMIN o PLANNER")
+
+
+def require_auditor(
+    user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    """Autoriza la consulta del historial completo y auditoria (HU5.3) a Contraloria/Auditor y Administracion."""
+    roles = _user_roles(user)
+    if _is_superadmin(roles) or "AUDITOR" in roles or "ADMIN" in roles:
+        return user
+    raise AccesoDenegadoError("Se requiere el rol AUDITOR o ADMIN")

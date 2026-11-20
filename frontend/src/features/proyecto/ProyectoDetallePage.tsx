@@ -16,6 +16,8 @@ import {
   getTechnicalFeasibility,
   getUnifiedAssessmentSummary,
   getPertEstimate,
+  getProcurementAntecedents,
+  getProcurementVerification,
   getProject,
   getProjectCheckpoint,
   registerCheckpointDecision,
@@ -23,6 +25,10 @@ import {
   getSocialAccessibility,
   registerPertEstimate,
   requestEvaluation,
+  requestProcurementVerification,
+  retryFailedDimensions,
+  updateProject,
+  upsertProcurementAntecedents,
   validateProject,
   zoningPrecheck,
 } from '../../api/pmv1.api'
@@ -30,10 +36,13 @@ import { useAuth } from '../auth/AuthContext'
 import type {
   CheckpointDecisionResponse,
   CheckpointResponse,
+  DimensionDispatchStatusItem,
   EvaluationResponse,
   HumanApprovalStatusResponse,
   PertEstimateResponse,
   PMV1ProjectResponse,
+  ProcurementAntecedentResponse,
+  ProcurementVerificationResponse,
   TechnicalFeasibilityResponse,
   UnifiedAssessmentSummaryResponse,
   EnvironmentalAssessmentResponse,
@@ -43,12 +52,47 @@ import type {
 } from '../../types/pmv1'
 import { newIdempotencyKey } from '../../utils/idempotency'
 import { mapPmV1ToProyecto } from '../../utils/pmv1Mapper'
-import { formatDate, formatFileSize } from '../../utils/format'
+import { formatCurrencyPrecise, formatDate, formatFileSize, formatNumber } from '../../utils/format'
 import { getPhysicalExpediente } from '../../utils/physicalExpedienteStorage'
 import { rememberProject } from '../../utils/recentProjects'
 
 const POLL_MS = 2000
 const POLL_MAX = 45
+
+const EXPEDIENTE_FIELD_LABELS: Record<string, string> = {
+  title: 'Nombre del proyecto',
+  description: 'Descripción',
+  location: 'Ubicación territorial',
+  proposed_land_use: 'Uso de suelo propuesto',
+  estimated_budget_pen: 'Presupuesto estimado (S/)',
+  beneficiaries_count: 'Beneficiarios estimados',
+  'estimated_budget_pen (> 0)': 'Presupuesto estimado (mayor a cero)',
+  'beneficiaries_count (> 0)': 'Beneficiarios estimados (mayor a cero)',
+}
+
+function formatMissingLabels(codes: string[]): string[] {
+  return codes.map((code) => EXPEDIENTE_FIELD_LABELS[code] || code)
+}
+
+function getMissingFieldsFromProject(p: PMV1ProjectResponse | null): { codes: string[]; labels: string[] } {
+  if (!p) return { codes: [], labels: [] }
+  const codes: string[] = []
+  if (!p.title || !p.title.trim()) codes.push('title')
+  if (!p.description || !p.description.trim()) codes.push('description')
+  if (!p.location || !p.location.trim()) codes.push('location')
+  if (!p.proposed_land_use || !p.proposed_land_use.trim()) codes.push('proposed_land_use')
+  if (p.estimated_budget_pen === null || p.estimated_budget_pen === undefined) {
+    codes.push('estimated_budget_pen')
+  } else if (Number(p.estimated_budget_pen) <= 0 || !Number.isFinite(Number(p.estimated_budget_pen))) {
+    codes.push('estimated_budget_pen (> 0)')
+  }
+  if (p.beneficiaries_count === null || p.beneficiaries_count === undefined) {
+    codes.push('beneficiaries_count')
+  } else if (Number(p.beneficiaries_count) <= 0 || !Number.isFinite(Number(p.beneficiaries_count))) {
+    codes.push('beneficiaries_count (> 0)')
+  }
+  return { codes, labels: formatMissingLabels(codes) }
+}
 
 export function ProyectoDetallePage() {
   const { projectId = '' } = useParams()
@@ -94,6 +138,42 @@ export function ProyectoDetallePage() {
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(flash ?? null)
   const [busy, setBusy] = useState<string | null>(null)
+  const [draftTitle, setDraftTitle] = useState('')
+  const [draftDescription, setDraftDescription] = useState('')
+  const [draftLocation, setDraftLocation] = useState('')
+  const [draftProposedLandUse, setDraftProposedLandUse] = useState('')
+  const [draftBudget, setDraftBudget] = useState('')
+  const [draftBeneficiaries, setDraftBeneficiaries] = useState('')
+  const [savingDraft, setSavingDraft] = useState(false)
+  const [draftError, setDraftError] = useState<string | null>(null)
+  const [draftSuccess, setDraftSuccess] = useState<string | null>(null)
+  const [showEditForm, setShowEditForm] = useState(false)
+  const [procAntecedents, setProcAntecedents] = useState<ProcurementAntecedentResponse | null>(null)
+  const [procVerification, setProcVerification] = useState<ProcurementVerificationResponse | null>(null)
+  const [procRegime, setProcRegime] = useState('')
+  const [procObject, setProcObject] = useState('')
+  const [procPhase, setProcPhase] = useState('')
+  const [procProcedure, setProcProcedure] = useState('')
+  const [procReqDefined, setProcReqDefined] = useState<'' | 'true' | 'false'>('')
+  const [procInCmn, setProcInCmn] = useState<'' | 'true' | 'false'>('')
+  const [procBudgetCert, setProcBudgetCert] = useState<'' | 'true' | 'false'>('')
+  const [procPladicop, setProcPladicop] = useState<'' | 'true' | 'false'>('')
+  const [procNoFrac, setProcNoFrac] = useState<'' | 'true' | 'false'>('')
+  const [procDocRef, setProcDocRef] = useState('')
+  const [procDirty, setProcDirty] = useState(false)
+  const [procError, setProcError] = useState<string | null>(null)
+  const [procSuccess, setProcSuccess] = useState<string | null>(null)
+
+  const canEditExpediente = hasRole('PLANNER') || hasRole('ADMIN')
+
+  const syncDraftFields = useCallback((data: PMV1ProjectResponse) => {
+    setDraftTitle(data.title ?? '')
+    setDraftDescription(data.description ?? '')
+    setDraftLocation(data.location ?? '')
+    setDraftProposedLandUse(data.proposed_land_use ?? '')
+    setDraftBudget(data.estimated_budget_pen != null ? String(data.estimated_budget_pen) : '')
+    setDraftBeneficiaries(data.beneficiaries_count != null ? String(data.beneficiaries_count) : '')
+  }, [])
 
   const loadProject = useCallback(async () => {
     if (!projectId) return
@@ -101,6 +181,7 @@ export function ProyectoDetallePage() {
     try {
       const data = await getProject(projectId)
       setProject(data)
+      syncDraftFields(data)
       if (data.checkpoint) {
         setCheckpoint(data.checkpoint)
       }
@@ -114,11 +195,34 @@ export function ProyectoDetallePage() {
       if (data.technical_assessment) {
         setTechnicalAssessment(data.technical_assessment)
       }
+      setEvaluation(
+        data.economic_evaluation &&
+          data.economic_evaluation.project_version_id === data.project_version_id
+          ? data.economic_evaluation
+          : null,
+      )
+      setZoning(
+        data.zoning_precheck &&
+          (!data.zoning_precheck.project_version_id ||
+            data.zoning_precheck.project_version_id === data.project_version_id)
+          ? data.zoning_precheck
+          : null,
+      )
       rememberProject(mapPmV1ToProyecto(data))
+      if (canEditExpediente) {
+        try {
+          const valRes = await validateProject(projectId, data.project_version_id)
+          setValidation(valRes)
+        } catch {
+          /* la validación oficial no bloquea la lectura del proyecto */
+        }
+      } else {
+        setValidation(null)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'No se pudo cargar el proyecto.')
     }
-  }, [projectId])
+  }, [projectId, canEditExpediente, syncDraftFields])
 
   const loadApproval = useCallback(async () => {
     if (!projectId) return
@@ -149,16 +253,12 @@ export function ProyectoDetallePage() {
       if (data?.evaluation_id) {
         try {
           const persistedEvaluation = await getEvaluation(data.evaluation_id)
-          setEvaluation(
-            persistedEvaluation.project_version_id === data.project_version_id
-              ? persistedEvaluation
-              : null,
-          )
+          if (persistedEvaluation.project_version_id === data.project_version_id) {
+            setEvaluation(persistedEvaluation)
+          }
         } catch {
-          setEvaluation(null)
+          /* mantener estado vigente si falla esta consulta opcional */
         }
-      } else {
-        setEvaluation(null)
       }
     } catch {
       /* opcional */
@@ -207,6 +307,31 @@ export function ProyectoDetallePage() {
       setUnifiedSummaryError(err instanceof Error ? err.message : 'No se pudo cargar el resumen unificado.')
     } finally {
       setUnifiedSummaryLoading(false)
+    }
+  }, [projectId])
+
+  const loadProcurement = useCallback(async (targetVersionId?: string) => {
+    if (!projectId) return
+    try {
+      const [ant, ver] = await Promise.all([
+        getProcurementAntecedents(projectId, targetVersionId),
+        getProcurementVerification(projectId, targetVersionId),
+      ])
+      setProcAntecedents(ant)
+      setProcVerification(ver)
+      setProcRegime(ant.contracting_regime ?? '')
+      setProcObject(ant.contract_object ?? '')
+      setProcPhase(ant.contracting_phase ?? '')
+      setProcProcedure(ant.selection_procedure ?? '')
+      setProcReqDefined(ant.requirement_defined === true ? 'true' : ant.requirement_defined === false ? 'false' : '')
+      setProcInCmn(ant.in_cmn_and_viability === true ? 'true' : ant.in_cmn_and_viability === false ? 'false' : '')
+      setProcBudgetCert(ant.budget_certification_declared === true ? 'true' : ant.budget_certification_declared === false ? 'false' : '')
+      setProcPladicop(ant.pladicop_registration_planned === true ? 'true' : ant.pladicop_registration_planned === false ? 'false' : '')
+      setProcNoFrac(ant.no_fractionation_declared === true ? 'true' : ant.no_fractionation_declared === false ? 'false' : '')
+      setProcDocRef(ant.supporting_document_ref ?? '')
+      setProcDirty(false)
+    } catch {
+      /* opcional si el rol no tiene acceso o no existe registro */
     }
   }, [projectId])
 
@@ -401,14 +526,15 @@ export function ProyectoDetallePage() {
     void loadTechnicalAssessment()
     void loadPertEstimate()
     void loadUnifiedSummary()
-  }, [loadProject, loadApproval, loadCheckpoint, loadSocialAssessment, loadEnvironmentalAssessment, loadTechnicalAssessment, loadPertEstimate, loadUnifiedSummary])
+    void loadProcurement()
+  }, [loadProject, loadApproval, loadCheckpoint, loadSocialAssessment, loadEnvironmentalAssessment, loadTechnicalAssessment, loadPertEstimate, loadUnifiedSummary, loadProcurement])
 
   const runValidate = async () => {
     if (!projectId) return
     setBusy('validate')
     setError(null)
     try {
-      const result = await validateProject(projectId)
+      const result = await validateProject(projectId, project?.project_version_id)
       setValidation(result)
       await loadProject()
       setInfo(result.complete ? 'Expediente completo — puede solicitar evaluación económica.' : result.message)
@@ -419,14 +545,60 @@ export function ProyectoDetallePage() {
     }
   }
 
+  const handleSaveExpedienteCompletion = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!projectId || !project) return
+    setSavingDraft(true)
+    setDraftError(null)
+    setDraftSuccess(null)
+    setError(null)
+    try {
+      const hasBudget = draftBudget.trim() !== ''
+      const hasBeneficiaries = draftBeneficiaries.trim() !== ''
+      const parsedBudget = Number(draftBudget)
+      const parsedBeneficiaries = Number(draftBeneficiaries)
+      const updated = await updateProject(projectId, {
+        title: draftTitle,
+        description: draftDescription,
+        location: draftLocation,
+        proposed_land_use: draftProposedLandUse,
+        estimated_budget_pen: hasBudget && Number.isFinite(parsedBudget) ? parsedBudget : null,
+        beneficiaries_count: hasBeneficiaries && Number.isFinite(parsedBeneficiaries) ? Math.trunc(parsedBeneficiaries) : null,
+        save_as_draft: false,
+      })
+      setProject(updated)
+      syncDraftFields(updated)
+      const valRes = await validateProject(projectId, updated.project_version_id)
+      setValidation(valRes)
+      setShowEditForm(false)
+      setDraftSuccess('Datos del expediente actualizados y validados correctamente. Ya puede solicitar la evaluación.')
+      setInfo('Expediente completado y habilitado para evaluación económica.')
+      await loadUnifiedSummary()
+    } catch (err) {
+      setDraftError(err instanceof Error ? err.message : 'No se pudo actualizar el expediente.')
+    } finally {
+      setSavingDraft(false)
+    }
+  }
+
+  const refreshAllDimensions = async () => {
+    await Promise.all([
+      loadCheckpoint(),
+      loadProject(),
+      loadApproval(),
+      loadSocialAssessment(),
+      loadEnvironmentalAssessment(),
+      loadTechnicalAssessment(),
+      loadUnifiedSummary(),
+    ])
+  }
+
   const pollEvaluation = async (evaluationId: string) => {
     for (let attempt = 0; attempt < POLL_MAX; attempt += 1) {
       const ev = await getEvaluation(evaluationId)
       setEvaluation(ev)
       if (ev.status === 'completed' || ev.status === 'failed' || ev.status === 'pending_review') {
-        await loadCheckpoint()
-        await loadProject()
-        await loadApproval()
+        await refreshAllDimensions()
         return ev
       }
       await new Promise((resolve) => setTimeout(resolve, POLL_MS))
@@ -443,24 +615,48 @@ export function ProyectoDetallePage() {
         project.project_version_id,
         newIdempotencyKey('eval'),
       )
-      setInfo(
-        accepted.duplicated
-          ? 'Ya existe una evaluación en curso para este expediente.'
-          : 'Evaluación económica iniciada. Espere unos segundos.',
-      )
       if (accepted.status === 'pending_review' || accepted.checkpoint) {
         setInfo(
           'Procesamiento detenido en punto de control: se detectó riesgo alto configurado para revisión humana (HU3.1).',
         )
         if (accepted.checkpoint) setCheckpoint(accepted.checkpoint)
-        await loadProject()
-        await loadApproval()
-        await loadCheckpoint()
+        await refreshAllDimensions()
         return
+      }
+      if (accepted.has_failed_dimensions) {
+        setInfo(
+          'Distribución ejecutada con falla controlada en uno o más especialistas. Revise el estado individual y reintente de forma segura sin repetir las dimensiones completadas.',
+        )
+      } else {
+        setInfo(
+          accepted.duplicated
+            ? 'Distribución ya registrada para esta versión del expediente (sin duplicados).'
+            : 'Expediente entregado a los cinco especialistas sobre la misma versión.',
+        )
       }
       await pollEvaluation(accepted.evaluation_id)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'No se pudo evaluar.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const runRetryFailedDimensions = async () => {
+    if (!projectId || !project?.project_version_id) return
+    setBusy('retry-dimensions')
+    setError(null)
+    try {
+      const ev = await retryFailedDimensions(projectId, project.project_version_id)
+      setEvaluation(ev)
+      await refreshAllDimensions()
+      setInfo(
+        ev.has_failed_dimensions
+          ? 'Se reintentaron las dimensiones pendientes, pero persiste una falla.'
+          : 'Dimensiones fallidas recuperadas de forma segura manteniendo intactos los resultados previos.',
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'No se pudo reintentar la evaluación.')
     } finally {
       setBusy(null)
     }
@@ -512,6 +708,69 @@ export function ProyectoDetallePage() {
     }
   }
 
+  const buildProcurementPayload = () => ({
+    contracting_regime: procRegime || null,
+    contract_object: procObject || null,
+    contracting_phase: procPhase || null,
+    selection_procedure: procProcedure || null,
+    requirement_defined: procReqDefined === 'true' ? true : procReqDefined === 'false' ? false : null,
+    in_cmn_and_viability: procInCmn === 'true' ? true : procInCmn === 'false' ? false : null,
+    budget_certification_declared: procBudgetCert === 'true' ? true : procBudgetCert === 'false' ? false : null,
+    pladicop_registration_planned: procPladicop === 'true' ? true : procPladicop === 'false' ? false : null,
+    no_fractionation_declared: procNoFrac === 'true' ? true : procNoFrac === 'false' ? false : null,
+    supporting_document_ref: procDocRef.trim() || null,
+  })
+
+  const saveProcurementAntecedents = async () => {
+    if (!projectId || !project?.project_version_id) return
+    setBusy('proc-save')
+    setProcError(null)
+    setProcSuccess(null)
+    try {
+      const updated = await upsertProcurementAntecedents(
+        projectId,
+        buildProcurementPayload(),
+        project.project_version_id,
+      )
+      setProcAntecedents(updated)
+      setProcDirty(false)
+      setProcSuccess('Antecedentes contractuales guardados para la versión vigente.')
+    } catch (err) {
+      setProcError(err instanceof Error ? err.message : 'No se pudieron guardar los antecedentes contractuales.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const runProcurementVerification = async () => {
+    if (!projectId || !project?.project_version_id) return
+    setBusy('proc-verify')
+    setProcError(null)
+    setProcSuccess(null)
+    try {
+      if (canEditExpediente && procDirty) {
+        const updated = await upsertProcurementAntecedents(
+          projectId,
+          buildProcurementPayload(),
+          project.project_version_id,
+        )
+        setProcAntecedents(updated)
+        setProcDirty(false)
+      }
+      const res = await requestProcurementVerification(
+        projectId,
+        newIdempotencyKey('proc'),
+        project.project_version_id,
+      )
+      setProcVerification(res)
+      await loadUnifiedSummary()
+    } catch (err) {
+      setProcError(err instanceof Error ? err.message : 'No se pudo verificar la Ley de Contrataciones.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const proyectoView = project ? mapPmV1ToProyecto(project) : null
   const physicalExpediente = projectId ? getPhysicalExpediente(projectId) : null
 
@@ -541,9 +800,9 @@ export function ProyectoDetallePage() {
       )
       setDecisionJustification('')
       setDecisionConditions('')
-      await loadCheckpointDecisions()
-      await loadCheckpoint()
       await loadProject()
+      await loadCheckpoint()
+      await loadCheckpointDecisions()
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'No se pudo registrar la constancia de decisión.',
@@ -596,6 +855,22 @@ export function ProyectoDetallePage() {
       ? rawCheckpoint
       : null
 
+  // HU3.3 / HU3.4: La API devuelve las decisiones en orden determinista descendente
+  // (decided_at DESC, created_at DESC, id DESC); solo habilita reanudar la última decisión vigente e íntegra.
+  const latestCheckpointDecision =
+    activeCheckpoint && project
+      ? checkpointDecisions.find(
+          (d) =>
+            d.checkpoint_id === activeCheckpoint.checkpoint_id &&
+            d.project_version_id === project.project_version_id,
+        ) ?? null
+      : null
+  const hasValidApproveContinueLatest = Boolean(
+    latestCheckpointDecision &&
+      latestCheckpointDecision.decision === 'approve_continue' &&
+      latestCheckpointDecision.verification_status === 'valid',
+  )
+
   // HU3.1 / HU3.2: El aviso de pausa aplica ÚNICAMENTE si la versión vigente posee un punto de control
   // activo en estado 'pending_review' correspondiente a esa versión.
   const isPaused = Boolean(
@@ -632,6 +907,58 @@ export function ProyectoDetallePage() {
     rawObservation && rawObservation !== pauseCause && rawObservation !== 'Observación pendiente de aclaración'
       ? rawObservation
       : null
+
+  const localCompleteness = getMissingFieldsFromProject(project)
+  const effectiveValidation =
+    validation &&
+    project &&
+    (!validation.project_version_id || validation.project_version_id === project.project_version_id)
+      ? validation
+      : null
+  const missingFieldCodes = effectiveValidation
+    ? effectiveValidation.missing_fields
+    : localCompleteness.codes
+  const missingFieldLabels =
+    effectiveValidation && !effectiveValidation.complete
+      ? effectiveValidation.missing_field_labels && effectiveValidation.missing_field_labels.length > 0
+        ? effectiveValidation.missing_field_labels
+        : formatMissingLabels(effectiveValidation.missing_fields)
+      : localCompleteness.labels
+  const isProjectComplete = Boolean(
+    project &&
+      localCompleteness.codes.length === 0 &&
+      (effectiveValidation ? effectiveValidation.complete : true),
+  )
+  const activeEvaluation =
+    evaluation &&
+    project &&
+    evaluation.project_version_id === project.project_version_id
+      ? evaluation
+      : null
+  const activeDispatches: DimensionDispatchStatusItem[] =
+    project && activeEvaluation?.dimension_dispatches && activeEvaluation.dimension_dispatches.length > 0
+      ? activeEvaluation.dimension_dispatches
+      : project?.dimension_dispatches ?? []
+  const activeHasFailedDimensions = Boolean(
+    activeDispatches.some((d) => d.status === 'failed') ||
+      activeEvaluation?.has_failed_dimensions ||
+      project?.has_failed_dimensions,
+  )
+  const activeZoning =
+    zoning &&
+    project &&
+    (!zoning.project_version_id || zoning.project_version_id === project.project_version_id)
+      ? zoning
+      : null
+  const hasEconomicInputs = Boolean(
+    project &&
+      project.estimated_budget_pen !== null &&
+      project.estimated_budget_pen !== undefined &&
+      Number(project.estimated_budget_pen) > 0 &&
+      project.beneficiaries_count !== null &&
+      project.beneficiaries_count !== undefined &&
+      Number(project.beneficiaries_count) > 0,
+  )
 
   return (
     <div className="form-page pmv1-flow">
@@ -842,7 +1169,7 @@ export function ProyectoDetallePage() {
                       </button>
                     </form>
 
-                    {checkpointDecisions.some((d) => d.decision === 'approve_continue' && d.checkpoint_id === activeCheckpoint?.checkpoint_id) ? (
+                    {hasValidApproveContinueLatest ? (
                       <form
                         onSubmit={handleResumeCheckpoint}
                         style={{
@@ -860,7 +1187,7 @@ export function ProyectoDetallePage() {
                           Reanudar evaluación desde el punto de control (HU3.4)
                         </h4>
                         <p style={{ margin: 0, fontSize: '0.8rem', color: '#4b5563' }}>
-                          Existe una aprobación de continuación registrada para esta versión. Puede reanudar el procesamiento conservando los resultados previos.
+                          La última constancia vigente es una aprobación de continuación con integridad SHA-256 verificada para esta versión. Puede reanudar el procesamiento conservando los resultados previos.
                         </p>
                         <div>
                           <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '0.25rem' }}>
@@ -898,6 +1225,26 @@ export function ProyectoDetallePage() {
                           {resumingCheckpoint ? 'Reanudando evaluación...' : 'Autorizar y reanudar evaluación'}
                         </button>
                       </form>
+                    ) : latestCheckpointDecision && latestCheckpointDecision.verification_status !== 'valid' ? (
+                      <div
+                        className="checkpoint-blocked-alert"
+                        style={{ margin: 0 }}
+                        data-testid="checkpoint-resume-blocked-notice"
+                      >
+                        <strong>Reanudación bloqueada por integridad:</strong> la última constancia de decisión
+                        registrada para este punto de control falló la verificación SHA-256. Registre una nueva
+                        aprobación de continuación íntegra para habilitar la reanudación.
+                      </div>
+                    ) : latestCheckpointDecision?.decision === 'request_correction' ? (
+                      <div
+                        className="checkpoint-blocked-alert"
+                        style={{ margin: 0 }}
+                        data-testid="checkpoint-resume-blocked-notice"
+                      >
+                        <strong>Reanudación bloqueada por decisión vigente:</strong> la última decisión registrada
+                        para este punto de control solicita corrección. La pausa permanece activa y las aprobaciones
+                        anteriores no habilitan reanudar hasta registrar una nueva aprobación de continuación.
+                      </div>
                     ) : (
                       <p className="checkpoint-footer-notice" style={{ margin: 0 }}>
                         Para reanudar la evaluación (HU3.4), primero debe registrarse una constancia de <strong>Aprobación para continuar</strong> sobre este punto de control y versión.
@@ -1092,54 +1439,443 @@ export function ProyectoDetallePage() {
             </section>
           )}
 
-          <section className="flow-panel">
+          <section className="flow-panel" data-testid="validation-panel">
             <h2>1. Validación del expediente</h2>
-            <p className="flow-hint">Verifica presupuesto, beneficiarios y datos territoriales antes de evaluar.</p>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              disabled={busy !== null}
-              onClick={() => void runValidate()}
-            >
-              {busy === 'validate' ? 'Validando…' : 'Validar expediente'}
-            </button>
-            {validation && (
-              <>
-                <Alert variant={validation.complete ? 'success' : 'error'}>
-                  {validation.message}
-                </Alert>
-                <TechnicalDetails data={validation} />
-              </>
-            )}
-          </section>
+            <p className="flow-hint">Verifica presupuesto, beneficiarios, descripción y datos territoriales antes de evaluar.</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                disabled={busy !== null}
+                onClick={() => void runValidate()}
+              >
+                {busy === 'validate' ? 'Validando…' : 'Validar expediente'}
+              </button>
+              {canEditExpediente && (project?.status === 'draft' || project?.status === 'ready') && (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => setShowEditForm((prev) => !prev)}
+                  data-testid="toggle-edit-draft-btn"
+                >
+                  {showEditForm || !isProjectComplete ? 'Completar / corregir datos del expediente' : 'Editar datos del expediente'}
+                </button>
+              )}
+            </div>
 
-          <section className="flow-panel">
-            <h2>2. Evaluación económica preliminar</h2>
-            {isPaused && (
-              <div className="checkpoint-blocked-alert" style={{ marginBottom: '1rem' }}>
-                <strong>Punto de control activo:</strong> La evaluación técnica de este expediente se encuentra detenida en estado <strong>Pendiente de revisión</strong> por detección de riesgo alto (HU3.1). No se continuará automáticamente hacia la finalización ni se emitirá puntaje final sin revisión humana previa.
+            {draftSuccess && <Alert variant="success">{draftSuccess}</Alert>}
+
+            {!isProjectComplete && (
+              <div data-testid="validation-missing-alert" style={{ marginTop: '0.75rem' }}>
+                <Alert variant="error">
+                  <strong>Expediente incompleto:</strong> complete los datos obligatorios antes de solicitar la evaluación:
+                  <ul style={{ margin: '0.35rem 0 0', paddingLeft: '1.25rem' }}>
+                    {missingFieldLabels.map((label, idx) => (
+                      <li key={`${missingFieldCodes[idx] ?? label}`}>{label}</li>
+                    ))}
+                  </ul>
+                </Alert>
               </div>
             )}
-            <p className="flow-hint">Disponible cuando el expediente esté completo.</p>
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={busy !== null || !project?.project_version_id || isPaused}
-              onClick={() => void runEvaluation()}
-            >
-              {busy === 'evaluation'
-                ? 'Procesando…'
-                : isPaused
-                  ? 'Evaluación en pausa por riesgo'
-                  : 'Solicitar evaluación'}
-            </button>
-            {evaluation?.result && (
-              <Alert variant="success">
-                Puntaje {evaluation.result.score_0_100.toFixed(1)}/100 ·{' '}
-                {evaluation.result.explanation}
-              </Alert>
+
+            {isProjectComplete && effectiveValidation?.complete && (
+              <div data-testid="validation-complete-alert" style={{ marginTop: '0.75rem' }}>
+                <Alert variant="success">
+                  {effectiveValidation.message}
+                </Alert>
+              </div>
             )}
-            {evaluation && <TechnicalDetails data={evaluation} />}
+
+            {canEditExpediente &&
+              (project?.status === 'draft' || project?.status === 'ready') &&
+              (!isProjectComplete || showEditForm) && (
+                <form
+                  onSubmit={handleSaveExpedienteCompletion}
+                  data-testid="complete-draft-form"
+                  style={{
+                    marginTop: '1rem',
+                    padding: '1rem',
+                    background: '#f8fafc',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '8px',
+                    display: 'grid',
+                    gap: '0.75rem',
+                  }}
+                >
+                  <h3 style={{ margin: 0, fontSize: '0.98rem', color: '#0f172a' }}>
+                    Completar o corregir datos obligatorios (Versión v{project.version_number})
+                  </h3>
+                  {draftError && <Alert variant="error">{draftError}</Alert>}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem' }}>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                        Nombre del proyecto *
+                      </label>
+                      <input
+                        type="text"
+                        className="form-field-input"
+                        style={{ width: '100%' }}
+                        value={draftTitle}
+                        onChange={(e) => setDraftTitle(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                        Ubicación territorial *
+                      </label>
+                      <input
+                        type="text"
+                        className="form-field-input"
+                        style={{ width: '100%' }}
+                        placeholder="Ej. Jr. Huancavelica cdra. 4, El Tambo"
+                        value={draftLocation}
+                        onChange={(e) => setDraftLocation(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                        Uso de suelo propuesto *
+                      </label>
+                      <input
+                        type="text"
+                        className="form-field-input"
+                        style={{ width: '100%' }}
+                        placeholder="Ej. Infraestructura urbana / Recreación"
+                        value={draftProposedLandUse}
+                        onChange={(e) => setDraftProposedLandUse(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                        Presupuesto estimado (S/) *
+                      </label>
+                      <input
+                        type="number"
+                        min={0.01}
+                        step={0.01}
+                        className="form-field-input"
+                        style={{ width: '100%' }}
+                        value={draftBudget}
+                        onChange={(e) => setDraftBudget(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                        Beneficiarios estimados *
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        className="form-field-input"
+                        style={{ width: '100%' }}
+                        value={draftBeneficiaries}
+                        onChange={(e) => setDraftBeneficiaries(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>
+                      Descripción *
+                    </label>
+                    <textarea
+                      rows={3}
+                      className="form-field-input"
+                      style={{ width: '100%' }}
+                      placeholder="Objetivo, alcance y beneficios esperados para la población."
+                      value={draftDescription}
+                      onChange={(e) => setDraftDescription(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="submit"
+                      className="btn btn-primary"
+                      disabled={savingDraft}
+                      data-testid="save-draft-completion-btn"
+                    >
+                      {savingDraft ? 'Guardando y validando…' : 'Guardar y validar expediente'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+            {effectiveValidation && <TechnicalDetails data={effectiveValidation} />}
+          </section>
+
+          <section className="flow-panel" data-testid="economic-evaluation-section">
+            <h2>2. Distribución a cinco especialistas y evaluación multidimensional (HU1.1)</h2>
+            {isPaused && (
+              <div className="checkpoint-blocked-alert" style={{ marginBottom: '1rem' }}>
+                <strong>Punto de control activo:</strong> La evaluación de este expediente se encuentra detenida en estado <strong>Pendiente de revisión</strong> por detección de riesgo alto (HU3.1). Distribuir o iniciar evaluación no equivale a aprobar el proyecto automáticamente.
+              </div>
+            )}
+            <p className="flow-hint">
+              {isProjectComplete
+                ? 'Expediente completo: al solicitar evaluación, el coordinador entrega esta misma versión (sin volver a cargarla) a los cinco especialistas: económico, social, ambiental, técnico y jurídico.'
+                : 'Evaluación bloqueada hasta completar los datos obligatorios del expediente (HU1.2).'}
+            </p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center' }}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                data-testid="request-evaluation-btn"
+                disabled={busy !== null || !project?.project_version_id || isPaused || !isProjectComplete}
+                onClick={() => void runEvaluation()}
+              >
+                {busy === 'evaluation'
+                  ? 'Distribuyendo y evaluando…'
+                  : isPaused
+                    ? 'Evaluación en pausa por riesgo'
+                    : !isProjectComplete
+                      ? 'Solicitar evaluación (datos incompletos)'
+                      : 'Solicitar evaluación'}
+              </button>
+              {activeHasFailedDimensions && (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  data-testid="retry-failed-dimensions-btn"
+                  disabled={busy !== null || isPaused || !isProjectComplete}
+                  onClick={() => void runRetryFailedDimensions()}
+                >
+                  {busy === 'retry-dimensions'
+                    ? 'Reintentando…'
+                    : 'Reintentar solo dimensiones fallidas'}
+                </button>
+              )}
+            </div>
+
+            {activeDispatches.length > 0 && project && (
+              <div
+                data-testid="multidimensional-dispatch-panel"
+                style={{
+                  marginTop: '1rem',
+                  background: '#f8fafc',
+                  border: '1px solid #cbd5e1',
+                  borderRadius: '8px',
+                  padding: '0.9rem 1rem',
+                  display: 'grid',
+                  gap: '0.75rem',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                  <strong style={{ fontSize: '0.92rem', color: '#0f172a' }}>
+                    Estado de distribución por especialista · Versión v{project.version_number}
+                  </strong>
+                  <code style={{ fontSize: '0.76rem', color: '#475569' }}>
+                    project_version_id: {project.project_version_id}
+                  </code>
+                </div>
+
+                {activeHasFailedDimensions && (
+                  <Alert variant="error">
+                    Evaluación multidimensional incompleta: uno o más especialistas fallaron. El expediente no se presenta como totalmente evaluado ni aprobado; los resultados exitosos se conservan intactos.
+                  </Alert>
+                )}
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.65rem' }}>
+                  {activeDispatches.map((d) => {
+                    const isOk = d.status === 'completed'
+                    const isFail = d.status === 'failed'
+                    const isInsuff = d.status === 'insufficient_data'
+                    const isReview = d.status === 'pending_review' || d.status === 'requires_review'
+                    const bg = isOk ? '#f0fdf4' : isFail ? '#fef2f2' : isInsuff || isReview ? '#fffbeb' : '#f1f5f9'
+                    const bd = isOk ? '#86efac' : isFail ? '#fca5a5' : isInsuff || isReview ? '#fcd34d' : '#cbd5e1'
+                    const fg = isOk ? '#166534' : isFail ? '#991b1b' : isInsuff || isReview ? '#92400e' : '#334155'
+                    return (
+                      <article
+                        key={d.dimension_code}
+                        data-testid={`dispatch-dim-${d.dimension_code}`}
+                        style={{
+                          background: bg,
+                          border: `1px solid ${bd}`,
+                          borderRadius: '6px',
+                          padding: '0.65rem 0.75rem',
+                          fontSize: '0.82rem',
+                          display: 'grid',
+                          gap: '0.25rem',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.4rem' }}>
+                          <strong style={{ color: '#0f172a' }}>{d.dimension_name}</strong>
+                          <span style={{ fontWeight: 700, fontSize: '0.74rem', color: fg }}>
+                            {d.status_label}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: '0.73rem', color: '#64748b' }}>
+                          Versión asignada: <code>{d.project_version_id.slice(0, 8)}</code> · Intento {d.attempt_count}
+                        </div>
+                        {(d.error_message || d.summary) && (
+                          <div style={{ color: isFail ? '#991b1b' : '#334155', lineHeight: 1.35 }}>
+                            {d.error_message || d.summary}
+                          </div>
+                        )}
+                      </article>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {!activeEvaluation?.result && !hasEconomicInputs && (
+              <div data-testid="economic-insufficient-card" style={{ marginTop: '0.85rem' }}>
+                <Alert variant="error">
+                  <strong>Información insuficiente (HU1.3):</strong> el costo por beneficiario y el retorno socioeconómico figuran como <strong>No calculable</strong> porque faltan el presupuesto estimado (&gt; 0) y/o la cantidad de beneficiarios (&gt; 0), y no existe método aprobado de retorno monetizado. No se realizan divisiones ni se inventan valores.
+                </Alert>
+              </div>
+            )}
+
+            {activeEvaluation?.result && (
+              <div
+                data-testid="economic-result-panel"
+                style={{
+                  marginTop: '1rem',
+                  display: 'grid',
+                  gap: '0.85rem',
+                }}
+              >
+                <div
+                  data-testid="cost-per-beneficiary-card"
+                  style={{
+                    background: '#f0fdf4',
+                    border: '1px solid #86efac',
+                    borderRadius: '8px',
+                    padding: '1rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <strong style={{ color: '#14532d', fontSize: '0.98rem' }}>
+                      {activeEvaluation.result.indicator_name ?? 'Costo por beneficiario'}
+                    </strong>
+                    <span style={{ fontSize: '1.35rem', fontWeight: 800, color: '#166534' }}>
+                      {formatCurrencyPrecise(activeEvaluation.result.cost_per_beneficiary_pen)} por beneficiario
+                    </span>
+                  </div>
+                  <div style={{ marginTop: '0.45rem', fontSize: '0.88rem', color: '#166534', display: 'grid', gap: '0.25rem' }}>
+                    <div>
+                      <strong>Fórmula aplicada:</strong>{' '}
+                      <code>{activeEvaluation.result.formula ?? 'presupuesto / beneficiarios'}</code>
+                      {' · '}
+                      {formatCurrencyPrecise(activeEvaluation.result.budget_pen ?? project?.estimated_budget_pen)}
+                      {' / '}
+                      {formatNumber(activeEvaluation.result.beneficiaries_count ?? project?.beneficiaries_count)} beneficiarios
+                    </div>
+                    <div>
+                      <strong>Moneda y redondeo:</strong>{' '}
+                      {activeEvaluation.result.currency ?? 'PEN (S/)'} · {activeEvaluation.result.rounding_rule ?? '2 decimales (ROUND_HALF_UP)'}
+                    </div>
+                    <div>
+                      <strong>Puntuación económica normalizada:</strong>{' '}
+                      {activeEvaluation.result.score_0_100.toFixed(2)}/100 · {activeEvaluation.result.explanation}
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  data-testid="socioeconomic-return-card"
+                  style={{
+                    background:
+                      activeEvaluation.result.socioeconomic_return !== null &&
+                      activeEvaluation.result.socioeconomic_return_status === 'calculated'
+                        ? '#f0fdf4'
+                        : '#fffbeb',
+                    border: `1px solid ${
+                      activeEvaluation.result.socioeconomic_return !== null &&
+                      activeEvaluation.result.socioeconomic_return_status === 'calculated'
+                        ? '#86efac'
+                        : '#fcd34d'
+                    }`,
+                    borderRadius: '8px',
+                    padding: '1rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <strong style={{ color: '#78350f', fontSize: '0.98rem' }}>
+                      Retorno socioeconómico
+                    </strong>
+                    <span
+                      style={{
+                        padding: '0.2rem 0.65rem',
+                        borderRadius: '999px',
+                        fontSize: '0.78rem',
+                        fontWeight: 700,
+                        background:
+                          activeEvaluation.result.socioeconomic_return !== null ? '#dcfce7' : '#fef3c7',
+                        color:
+                          activeEvaluation.result.socioeconomic_return !== null ? '#166534' : '#92400e',
+                        border: `1px solid ${
+                          activeEvaluation.result.socioeconomic_return !== null ? '#22c55e' : '#f59e0b'
+                        }`,
+                      }}
+                    >
+                      {activeEvaluation.result.socioeconomic_return !== null
+                        ? `${activeEvaluation.result.socioeconomic_return}`
+                        : (activeEvaluation.result.socioeconomic_return_label ?? 'No calculable')}
+                    </span>
+                  </div>
+                  {activeEvaluation.result.socioeconomic_return !== null &&
+                  activeEvaluation.result.socioeconomic_return_method ? (
+                    <div style={{ marginTop: '0.5rem', fontSize: '0.86rem', color: '#14532d', display: 'grid', gap: '0.25rem' }}>
+                      <div>
+                        <strong>Método aprobado:</strong>{' '}
+                        {activeEvaluation.result.socioeconomic_return_method.method_name} (
+                        {activeEvaluation.result.socioeconomic_return_method.method_version}) ·{' '}
+                        <code>{activeEvaluation.result.socioeconomic_return_method.formula}</code>
+                      </div>
+                      {activeEvaluation.result.socioeconomic_return_variables && (
+                        <div>
+                          <strong>Variables empleadas:</strong>{' '}
+                          {Object.entries(activeEvaluation.result.socioeconomic_return_variables)
+                            .map(([k, v]) => `${k}: ${String(v)}`)
+                            .join(' · ')}
+                        </div>
+                      )}
+                      {activeEvaluation.result.socioeconomic_return_sources &&
+                        activeEvaluation.result.socioeconomic_return_sources.length > 0 && (
+                          <div>
+                            <strong>Fuentes trazables:</strong>{' '}
+                            {activeEvaluation.result.socioeconomic_return_sources.join('; ')}
+                          </div>
+                        )}
+                    </div>
+                  ) : (
+                    <>
+                      <p style={{ margin: '0.45rem 0 0', fontSize: '0.88rem', color: '#78350f', lineHeight: 1.45 }}>
+                        <strong>Motivo (Información insuficiente / cálculo deshabilitado sin método aprobado):</strong>{' '}
+                        {activeEvaluation.result.socioeconomic_return_reason ??
+                          'No existe un método aprobado de retorno socioeconómico (p. ej. VAN/TIR/B-C) ni flujos trazables de beneficios monetizados, costos de operación y tasa social de descuento; no se inventa ningún valor.'}
+                      </p>
+                      <div style={{ marginTop: '0.55rem', fontSize: '0.82rem', color: '#78350f' }}>
+                        <strong>Punto de integración:</strong>{' '}
+                        {activeEvaluation.result.socioeconomic_return_integration_status ===
+                        'awaiting_complete_inputs'
+                          ? 'Método configurado, esperando entradas verificables del expediente.'
+                          : 'Deshabilitado hasta que se defina y apruebe el método oficial y sus variables obligatorias:'}
+                        {activeEvaluation.result.socioeconomic_return_missing_requirements &&
+                          activeEvaluation.result.socioeconomic_return_missing_requirements.length > 0 && (
+                            <ul
+                              data-testid="socioeconomic-missing-requirements"
+                              style={{ margin: '0.35rem 0 0', paddingLeft: '1.2rem', display: 'grid', gap: '0.15rem' }}
+                            >
+                              {activeEvaluation.result.socioeconomic_return_missing_requirements.map((req) => (
+                                <li key={req}>{req}</li>
+                              ))}
+                            </ul>
+                          )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+            {activeEvaluation && <TechnicalDetails data={activeEvaluation} />}
           </section>
 
           <section className="flow-panel social-flow-panel">
@@ -1156,17 +1892,27 @@ export function ProyectoDetallePage() {
 
             {hasRole('PLANNER') && (
               <div style={{ marginBottom: '1rem' }}>
+                {!isProjectComplete && (
+                  <div style={{ marginBottom: '0.65rem' }}>
+                    <Alert variant="error">
+                      Evaluación social bloqueada hasta completar los datos obligatorios: {missingFieldLabels.join(', ')}. La vista territorial previa sigue disponible en solo lectura.
+                    </Alert>
+                  </div>
+                )}
                 <button
                   type="button"
                   className="btn btn-primary"
-                  disabled={busy !== null || isPaused}
+                  data-testid="evaluate-social-btn"
+                  disabled={busy !== null || isPaused || !isProjectComplete}
                   onClick={() => void runSocialAssessment()}
                 >
                   {busy === 'social'
                     ? 'Evaluando accesibilidad y equidad…'
-                    : socialAssessment
-                    ? 'Actualizar evaluación social'
-                    : 'Evaluar accesibilidad y equidad social'}
+                    : !isProjectComplete
+                      ? 'Evaluación social bloqueada (datos incompletos)'
+                      : socialAssessment
+                        ? 'Actualizar evaluación social'
+                        : 'Evaluar accesibilidad y equidad social'}
                 </button>
               </div>
             )}
@@ -1549,17 +2295,27 @@ export function ProyectoDetallePage() {
 
             {hasRole('PLANNER') && (
               <div style={{ marginBottom: '1rem' }}>
+                {!isProjectComplete && (
+                  <div style={{ marginBottom: '0.65rem' }}>
+                    <Alert variant="error">
+                      Evaluación ambiental bloqueada hasta completar los datos obligatorios: {missingFieldLabels.join(', ')}. La consulta preliminar sigue disponible en solo lectura.
+                    </Alert>
+                  </div>
+                )}
                 <button
                   type="button"
                   className="btn btn-primary"
-                  disabled={busy !== null || isPaused}
+                  data-testid="evaluate-environmental-btn"
+                  disabled={busy !== null || isPaused || !isProjectComplete}
                   onClick={() => void runEnvironmentalAssessment()}
                 >
                   {busy === 'environmental'
                     ? 'Evaluando impacto ambiental…'
-                    : environmentalAssessment
-                    ? 'Actualizar evaluación ambiental'
-                    : 'Evaluar impacto ambiental'}
+                    : !isProjectComplete
+                      ? 'Evaluación ambiental bloqueada (datos incompletos)'
+                      : environmentalAssessment
+                        ? 'Actualizar evaluación ambiental'
+                        : 'Evaluar impacto ambiental'}
                 </button>
               </div>
             )}
@@ -1889,18 +2645,27 @@ export function ProyectoDetallePage() {
 
             {hasRole('PLANNER') && (
               <div className="technical-actions">
+                {!isProjectComplete && (
+                  <div style={{ marginBottom: '0.65rem' }}>
+                    <Alert variant="error">
+                      Evaluación técnica bloqueada hasta completar los datos obligatorios: {missingFieldLabels.join(', ')}. Los parámetros previos siguen consultables en solo lectura.
+                    </Alert>
+                  </div>
+                )}
                 <button
                   type="button"
                   className="btn btn-primary"
                   onClick={handleEvaluateTechnical}
-                  disabled={technicalLoading || isPaused}
+                  disabled={technicalLoading || isPaused || !isProjectComplete}
                   data-testid="evaluate-technical-feasibility-btn"
                 >
                   {technicalLoading
                     ? 'Evaluando parámetros técnicos...'
-                    : technicalAssessment
-                      ? 'Reevaluar viabilidad técnica'
-                      : 'Ejecutar preevaluación técnica'}
+                    : !isProjectComplete
+                      ? 'Evaluación técnica bloqueada (datos incompletos)'
+                      : technicalAssessment
+                        ? 'Reevaluar viabilidad técnica'
+                        : 'Ejecutar preevaluación técnica'}
                 </button>
               </div>
             )}
@@ -2358,29 +3123,686 @@ export function ProyectoDetallePage() {
                 Revisión jurídica temporalmente detenida por el punto de control activo.
               </div>
             ) : (
-              <Link
-                to={`/proyectos/${projectId}/revision-juridica`}
-                className="btn btn-primary"
-              >
-                Abrir detalle de revisión jurídica y citas exactas
-              </Link>
+              <>
+                {!isProjectComplete && (
+                  <div style={{ marginBottom: '0.65rem' }}>
+                    <Alert variant="error">
+                      Evaluación jurídica formal bloqueada hasta completar: {missingFieldLabels.join(', ')}. Puede consultar el detalle normativo en solo lectura.
+                    </Alert>
+                  </div>
+                )}
+                <Link
+                  to={`/proyectos/${projectId}/revision-juridica`}
+                  className="btn btn-primary"
+                >
+                  Abrir detalle de revisión jurídica y citas exactas
+                </Link>
+
+                <div
+                  data-testid="procurement-section"
+                  style={{
+                    marginTop: '1.15rem',
+                    paddingTop: '1rem',
+                    borderTop: '1px solid #e2e8f0',
+                    display: 'grid',
+                    gap: '0.85rem',
+                  }}
+                >
+                  <div>
+                    <span className="story-label">PMV 1 · HU1.10 · Ley N.° 32069 y D.S. N.° 009-2025-EF</span>
+                    <h3 style={{ margin: '0.2rem 0 0', fontSize: '1.02rem' }}>
+                      Verificación preliminar de Ley de Contrataciones Públicas (v. OECE 2026)
+                    </h3>
+                    <p style={{ margin: '0.3rem 0 0', fontSize: '0.84rem', color: '#475569' }}>
+                      Contrasta únicamente antecedentes contractuales estructurados (sin inferir cumplimiento desde el título o descripción) contra fragmentos vigentes y actualizados al Compendio OECE (excluyendo Ley 26850, Ley 30225 y texto 2024-v1 pre-vigencia).
+                    </p>
+                  </div>
+
+                  {procError && <Alert variant="error">{procError}</Alert>}
+                  {procSuccess && <Alert variant="success">{procSuccess}</Alert>}
+
+                  {canEditExpediente && (
+                    <div
+                      data-testid="procurement-antecedents-form"
+                      style={{
+                        background: '#f8fafc',
+                        border: '1px solid #cbd5e1',
+                        borderRadius: '8px',
+                        padding: '0.9rem',
+                        display: 'grid',
+                        gap: '0.7rem',
+                      }}
+                    >
+                      <strong style={{ fontSize: '0.88rem', color: '#0f172a' }}>
+                        Antecedentes contractuales de la versión vigente {project ? `(v${project.version_number})` : ''}
+                      </strong>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.6rem' }}>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.8rem', fontWeight: 600 }}>
+                          Régimen contractual
+                          <select
+                            data-testid="proc-regime-select"
+                            className="form-field-input"
+                            value={procRegime}
+                            onChange={(e) => { setProcRegime(e.target.value); setProcDirty(true) }}
+                          >
+                            <option value="">-- Sin especificar --</option>
+                            <option value="ley_32069">Ley N.° 32069 y D.S. N.° 009-2025-EF (Vigente)</option>
+                            <option value="ley_30225_historica">Ley N.° 30225 (Sustituida el 22/04/2025)</option>
+                            <option value="ley_26850_historica">Ley N.° 26850 (Histórica derogada)</option>
+                            <option value="regimen_especial">Régimen especial</option>
+                            <option value="administracion_directa">Administración directa</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.8rem', fontWeight: 600 }}>
+                          Objeto contractual
+                          <select
+                            data-testid="proc-object-select"
+                            className="form-field-input"
+                            value={procObject}
+                            onChange={(e) => { setProcObject(e.target.value); setProcDirty(true) }}
+                          >
+                            <option value="">-- Sin especificar --</option>
+                            <option value="obra">Obra pública</option>
+                            <option value="bien">Bienes</option>
+                            <option value="servicio">Servicios</option>
+                            <option value="consultoria_obra">Consultoría de obra</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.8rem', fontWeight: 600 }}>
+                          Fase contractual
+                          <select
+                            data-testid="proc-phase-select"
+                            className="form-field-input"
+                            value={procPhase}
+                            onChange={(e) => { setProcPhase(e.target.value); setProcDirty(true) }}
+                          >
+                            <option value="">-- Sin especificar --</option>
+                            <option value="programacion_cmn">Programación Multianual (PMBSO / CMN)</option>
+                            <option value="actuaciones_preparatorias">Actuaciones preparatorias</option>
+                            <option value="seleccion">Selección</option>
+                            <option value="ejecucion_contractual">Ejecución contractual</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.8rem', fontWeight: 600 }}>
+                          Procedimiento / modalidad
+                          <select
+                            data-testid="proc-procedure-select"
+                            className="form-field-input"
+                            value={procProcedure}
+                            onChange={(e) => { setProcProcedure(e.target.value); setProcDirty(true) }}
+                          >
+                            <option value="">-- Sin especificar --</option>
+                            <option value="licitacion_publica">Licitación pública</option>
+                            <option value="concurso_publico">Concurso público</option>
+                            <option value="modalidad_abreviada">Modalidad abreviada</option>
+                            <option value="subasta_inversa_electronica">Subasta inversa electrónica</option>
+                            <option value="comparacion_precios">Comparación de precios</option>
+                            <option value="contrato_menor">Contrato menor (&lt;= 8 UIT = S/ 44,000)</option>
+                            <option value="contratacion_no_competitiva">Contratación no competitiva</option>
+                          </select>
+                        </label>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.6rem' }}>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          Requerimiento / Exp. Técnico (Art. 46)
+                          <select
+                            data-testid="proc-req-defined"
+                            className="form-field-input"
+                            value={procReqDefined}
+                            onChange={(e) => { setProcReqDefined(e.target.value as '' | 'true' | 'false'); setProcDirty(true) }}
+                          >
+                            <option value="">Sin indicar</option>
+                            <option value="true">Sí, definido y sustentado</option>
+                            <option value="false">No definido / incompleto</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          En CMN y viabilidad Invierte.pe (Reg. 46/54)
+                          <select
+                            data-testid="proc-cmn"
+                            className="form-field-input"
+                            value={procInCmn}
+                            onChange={(e) => { setProcInCmn(e.target.value as '' | 'true' | 'false'); setProcDirty(true) }}
+                          >
+                            <option value="">Sin indicar</option>
+                            <option value="true">Sí, incluido y viable</option>
+                            <option value="false">No consta en CMN o sin viabilidad</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          Certificación / previsión presupuestal (Reg. 54.2.f)
+                          <select
+                            data-testid="proc-budget-cert"
+                            className="form-field-input"
+                            value={procBudgetCert}
+                            onChange={(e) => { setProcBudgetCert(e.target.value as '' | 'true' | 'false'); setProcDirty(true) }}
+                          >
+                            <option value="">Sin indicar</option>
+                            <option value="true">Sí, declarada</option>
+                            <option value="false">No cuenta con certificación</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          Registro en PLADICOP (Art. 41 mod. Ley 32187)
+                          <select
+                            data-testid="proc-pladicop"
+                            className="form-field-input"
+                            value={procPladicop}
+                            onChange={(e) => { setProcPladicop(e.target.value as '' | 'true' | 'false'); setProcDirty(true) }}
+                          >
+                            <option value="">Sin indicar</option>
+                            <option value="true">Sí, previsto / registrado</option>
+                            <option value="false">No previsto en PLADICOP</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          Sin fraccionamiento indebido (Art. 50 / Reg. 45)
+                          <select
+                            data-testid="proc-no-frac"
+                            className="form-field-input"
+                            value={procNoFrac}
+                            onChange={(e) => { setProcNoFrac(e.target.value as '' | 'true' | 'false'); setProcDirty(true) }}
+                          >
+                            <option value="">Sin indicar</option>
+                            <option value="true">Sí, sin fraccionamiento</option>
+                            <option value="false">Posible fraccionamiento advertido</option>
+                          </select>
+                        </label>
+                        <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.78rem', fontWeight: 600 }}>
+                          Documento / referencia contractual
+                          <input
+                            data-testid="proc-doc-ref"
+                            type="text"
+                            className="form-field-input"
+                            placeholder="Ej. Memo-DEC-045-2026 / TdR-012"
+                            value={procDocRef}
+                            onChange={(e) => { setProcDocRef(e.target.value); setProcDirty(true) }}
+                          />
+                        </label>
+                      </div>
+
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          data-testid="save-procurement-antecedents-btn"
+                          disabled={busy !== null}
+                          onClick={() => void saveProcurementAntecedents()}
+                        >
+                          {busy === 'proc-save' ? 'Guardando antecedentes…' : 'Guardar antecedentes contractuales'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          data-testid="verify-procurement-btn"
+                          disabled={busy !== null}
+                          onClick={() => void runProcurementVerification()}
+                        >
+                          {busy === 'proc-verify' ? 'Verificando Ley 32069…' : 'Verificar Ley de Contrataciones (HU1.10)'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {!canEditExpediente && (
+                    <div>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        data-testid="verify-procurement-btn"
+                        disabled={busy !== null}
+                        onClick={() => void runProcurementVerification()}
+                      >
+                        {busy === 'proc-verify' ? 'Verificando Ley 32069…' : 'Ejecutar verificación Ley de Contrataciones (HU1.10)'}
+                      </button>
+                    </div>
+                  )}
+
+                  {procVerification && (
+                    <div
+                      data-testid="procurement-result-card"
+                      style={{
+                        background:
+                          procVerification.status === 'verified_preliminary'
+                            ? '#f0fdf4'
+                            : procVerification.status === 'possible_incompatibility'
+                              ? '#fef2f2'
+                              : '#fffbeb',
+                        border: `1px solid ${
+                          procVerification.status === 'verified_preliminary'
+                            ? '#86efac'
+                            : procVerification.status === 'possible_incompatibility'
+                              ? '#fca5a5'
+                              : '#fcd34d'
+                        }`,
+                        borderRadius: '8px',
+                        padding: '0.95rem',
+                        display: 'grid',
+                        gap: '0.65rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                        <strong
+                          style={{
+                            color:
+                              procVerification.status === 'verified_preliminary'
+                                ? '#166534'
+                                : procVerification.status === 'possible_incompatibility'
+                                  ? '#991b1b'
+                                  : '#92400e',
+                          }}
+                        >
+                          {procVerification.status_label} · Versión v{procVerification.version_number}
+                        </strong>
+                        <span
+                          className={`status-pill ${
+                            procVerification.status === 'verified_preliminary'
+                              ? 'status-approved'
+                              : procVerification.status === 'possible_incompatibility'
+                                ? 'status-error'
+                                : 'status-review'
+                          }`}
+                        >
+                          {procVerification.status === 'verified_preliminary'
+                            ? 'Preliminar compatible (sujeto a DEC/Asesoría)'
+                            : procVerification.status === 'possible_incompatibility'
+                              ? 'Posible incompatibilidad (No certifica infracción)'
+                              : 'Requiere revisión'}
+                        </span>
+                      </div>
+
+                      <p style={{ margin: 0, fontSize: '0.88rem', lineHeight: 1.45 }}>
+                        {procVerification.summary}
+                      </p>
+
+                      {procVerification.sent_to_legal_advisor && procVerification.status === 'possible_incompatibility' && (
+                        <div
+                          data-testid="procurement-legal-handoff"
+                          style={{
+                            background: '#fee2e2',
+                            padding: '0.55rem 0.75rem',
+                            borderRadius: '6px',
+                            fontSize: '0.83rem',
+                            color: '#991b1b',
+                            fontWeight: 600,
+                          }}
+                        >
+                          Observación remitida al Asesor Jurídico para validación humana (sin certificar infracción automática).{' '}
+                          <Link to={`/proyectos/${projectId}/revision-juridica`} style={{ color: '#7f1d1d', textDecoration: 'underline' }}>
+                            Revisar en módulo del Asesor Jurídico
+                          </Link>
+                        </div>
+                      )}
+
+                      {procVerification.missing_fields.length > 0 && (
+                        <div
+                          data-testid="procurement-missing-fields"
+                          style={{
+                            background: '#fef3c7',
+                            padding: '0.55rem 0.75rem',
+                            borderRadius: '6px',
+                            fontSize: '0.82rem',
+                            color: '#78350f',
+                          }}
+                        >
+                          <strong>Antecedentes o sustentos faltantes ({procVerification.missing_fields.length}):</strong>{' '}
+                          {procVerification.missing_fields.join('; ')}.
+                        </div>
+                      )}
+
+                      <div data-testid="procurement-requirements-list" style={{ display: 'grid', gap: '0.45rem' }}>
+                        <strong style={{ fontSize: '0.84rem', color: '#0f172a' }}>
+                          Requisitos examinados (Fecha de consulta oficial OECE/MEF: {procVerification.consulted_at})
+                        </strong>
+                        {procVerification.examined_requirements.map((req) => (
+                          <article
+                            key={req.requirement_code}
+                            data-testid={`proc-req-${req.requirement_code}`}
+                            style={{
+                              background: '#ffffff',
+                              border: '1px solid #cbd5e1',
+                              borderRadius: '6px',
+                              padding: '0.6rem 0.75rem',
+                              fontSize: '0.81rem',
+                              display: 'grid',
+                              gap: '0.25rem',
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.35rem' }}>
+                              <strong>{req.requirement_name}</strong>
+                              <span
+                                style={{
+                                  fontWeight: 700,
+                                  color:
+                                    req.status === 'compliant_preliminary'
+                                      ? '#166534'
+                                      : req.status === 'possible_incompatibility'
+                                        ? '#991b1b'
+                                        : '#92400e',
+                                }}
+                              >
+                                {req.status_label}
+                              </span>
+                            </div>
+                            <div style={{ color: '#334155' }}>
+                              <strong>Dato del expediente:</strong> {req.expedient_evidence}
+                            </div>
+                            <div style={{ color: '#0f172a' }}>
+                              <strong>Cotejo:</strong> {req.comparison_detail}
+                            </div>
+                            {req.norm_id && (
+                              <div style={{ color: '#475569', fontSize: '0.78rem' }}>
+                                <strong>Norma y fragmento:</strong> {req.norm_name} · Versión <code>{req.norm_version}</code> ·{' '}
+                                <strong>{req.article_or_section}</strong>
+                                {req.fragment_excerpt && (
+                                  <div style={{ marginTop: '0.2rem', fontStyle: 'italic' }}>
+                                    “{req.fragment_excerpt}”
+                                  </div>
+                                )}
+                                {req.amendments_note && (
+                                  <div style={{ marginTop: '0.15rem' }}>
+                                    <strong>Modificatorias y vigencia:</strong> {req.amendments_note}
+                                  </div>
+                                )}
+                                {req.official_url && (
+                                  <div style={{ marginTop: '0.15rem' }}>
+                                    <a href={req.official_url} target="_blank" rel="noreferrer">
+                                      {req.official_url}
+                                    </a>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </article>
+                        ))}
+                      </div>
+
+                      {procVerification.superseded_sources_excluded.length > 0 && (
+                        <div style={{ fontSize: '0.78rem', color: '#475569' }}>
+                          <strong>Fuentes históricas excluidas ({procVerification.superseded_sources_excluded.length}):</strong>{' '}
+                          {procVerification.superseded_sources_excluded.map((s) => `${s.fragment_id} (${s.version})`).join(', ')}.
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {!procVerification && procAntecedents && (
+                    <div style={{ fontSize: '0.78rem', color: '#475569' }}>
+                      Fuentes activas cargadas: {procAntecedents.active_normative_sources.length} · Fuentes históricas excluidas:{' '}
+                      {procAntecedents.historical_normative_sources.length}.
+                    </div>
+                  )}
+                </div>
+              </>
             )}
           </section>
 
-          <section className="flow-panel">
+          <section className="flow-panel" data-testid="zoning-section">
             <h2>4. Compatibilidad urbanística (HU1.11)</h2>
             <p className="flow-hint">
-              Revisa de forma preliminar el uso de suelo declarado frente al PDU/PDM.
+              Coteja el uso de suelo propuesto frente al PDM Huancayo 2017-2037 (O.M. N.° 636-2020-MPH/CM) y capas geoespaciales versionadas, absteniéndose si no existe capa GIS predial verificable.
             </p>
             <button
               type="button"
               className="btn btn-secondary"
+              data-testid="run-zoning-btn"
               disabled={busy !== null || isPaused}
               onClick={() => void runZoning()}
             >
               {busy === 'zoning' ? 'Analizando…' : 'Analizar compatibilidad urbanística'}
             </button>
-            {zoning && <TechnicalDetails data={zoning} />}
+
+            {activeZoning && (
+              <div data-testid="zoning-result-card" style={{ marginTop: '0.9rem', display: 'grid', gap: '0.75rem' }}>
+                {activeZoning.is_synthetic_data && (
+                  <div
+                    data-testid="zoning-synthetic-banner"
+                    style={{
+                      background: '#ffedd5',
+                      border: '2px solid #ea580c',
+                      color: '#9a3412',
+                      borderRadius: '8px',
+                      padding: '0.75rem 1rem',
+                      fontSize: '0.86rem',
+                      fontWeight: 700,
+                    }}
+                  >
+                    DATOS SINTÉTICOS DE PRUEBA TÉCNICA (NO OFICIAL): esta ejecución usa un polígono ficticio de ensayo para validar el mecanismo espacial. No acredita compatibilidad ni zonificación real del PDM Huancayo.
+                  </div>
+                )}
+                <div
+                  style={{
+                    background:
+                      activeZoning.compatible === true
+                        ? '#f0fdf4'
+                        : activeZoning.compatible === false
+                          ? '#fef2f2'
+                          : '#fffbeb',
+                    border: `1px solid ${
+                      activeZoning.compatible === true
+                        ? '#86efac'
+                        : activeZoning.compatible === false
+                          ? '#fca5a5'
+                          : '#fcd34d'
+                    }`,
+                    borderRadius: '8px',
+                    padding: '1rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <strong
+                      style={{
+                        color:
+                          activeZoning.compatible === true
+                            ? '#14532d'
+                            : activeZoning.compatible === false
+                              ? '#991b1b'
+                              : '#78350f',
+                      }}
+                    >
+                      {activeZoning.status_label ??
+                        (activeZoning.compatible === true
+                          ? 'Compatibilidad preliminar sustentada'
+                          : activeZoning.compatible === false
+                            ? 'Posible incompatibilidad · Derivado a revisión jurídica'
+                            : 'Requiere revisión / Información insuficiente')}
+                    </strong>
+                    <span
+                      style={{
+                        padding: '0.2rem 0.65rem',
+                        borderRadius: '999px',
+                        fontSize: '0.78rem',
+                        fontWeight: 700,
+                        background:
+                          activeZoning.compatible === true
+                            ? '#dcfce7'
+                            : activeZoning.compatible === false
+                              ? '#fee2e2'
+                              : '#fef3c7',
+                        color:
+                          activeZoning.compatible === true
+                            ? '#166534'
+                            : activeZoning.compatible === false
+                              ? '#991b1b'
+                              : '#92400e',
+                      }}
+                    >
+                      {activeZoning.compatible === true
+                        ? 'Compatible preliminar'
+                        : activeZoning.compatible === false
+                          ? 'Posible incompatibilidad'
+                          : 'Información insuficiente / Requiere revisión'}
+                    </span>
+                    <span
+                      data-testid="zoning-coverage-pill"
+                      style={{
+                        padding: '0.18rem 0.55rem',
+                        borderRadius: '999px',
+                        fontSize: '0.74rem',
+                        fontWeight: 600,
+                        background: '#e2e8f0',
+                        color: '#334155',
+                      }}
+                    >
+                      Cobertura espacial:{' '}
+                      {activeZoning.coverage_status === 'inside_coverage'
+                        ? 'Dentro de cobertura consultada'
+                        : activeZoning.coverage_status === 'outside_coverage'
+                          ? 'Fuera de cobertura territorial'
+                          : 'Sin capa GIS oficial verificable'}
+                    </span>
+                  </div>
+
+                  {activeZoning.preliminary_conclusion && (
+                    <p style={{ margin: '0.5rem 0 0', fontSize: '0.9rem', lineHeight: 1.45 }}>
+                      {activeZoning.preliminary_conclusion}
+                    </p>
+                  )}
+
+                  <p style={{ margin: '0.45rem 0 0', fontSize: '0.85rem', color: '#475569', lineHeight: 1.45 }}>
+                    <strong>Alcance y limitaciones:</strong> {activeZoning.limitations}
+                  </p>
+
+                  {activeZoning.environmental_risk_notice && (
+                    <div
+                      data-testid="zoning-environmental-risk-notice"
+                      style={{
+                        marginTop: '0.65rem',
+                        padding: '0.6rem 0.75rem',
+                        background: '#fff7ed',
+                        border: '1px solid #fdba74',
+                        borderRadius: '6px',
+                        fontSize: '0.84rem',
+                        color: '#9a3412',
+                      }}
+                    >
+                      <strong>Aviso de riesgo territorial (sin dictamen zonal automático):</strong>{' '}
+                      {activeZoning.environmental_risk_notice}
+                    </div>
+                  )}
+
+                  {activeZoning.flagged_for_legal_review && (
+                    <div
+                      data-testid="zoning-legal-handoff-notice"
+                      style={{
+                        marginTop: '0.65rem',
+                        padding: '0.5rem 0.75rem',
+                        background: '#fee2e2',
+                        borderRadius: '6px',
+                        fontSize: '0.84rem',
+                        color: '#991b1b',
+                        fontWeight: 600,
+                      }}
+                    >
+                      Observación territorial señalada para revisión jurídica humana (sin certificar infracción automática).{' '}
+                      <Link to={`/proyectos/${projectId}/revision-juridica`} style={{ color: '#7f1d1d', textDecoration: 'underline' }}>
+                        Ver en Revisión Jurídica
+                      </Link>
+                    </div>
+                  )}
+                </div>
+
+                {activeZoning.normative_amendments && activeZoning.normative_amendments.length > 0 && (
+                  <div style={{ display: 'grid', gap: '0.45rem' }} data-testid="zoning-amendments-list">
+                    <strong style={{ fontSize: '0.88rem', color: '#0f172a' }}>
+                      Vigencia por ámbito y modificaciones parciales del PDM 2017–2037 ({activeZoning.normative_amendments.length})
+                    </strong>
+                    <div style={{ display: 'grid', gap: '0.4rem', maxHeight: '280px', overflowY: 'auto', paddingRight: '0.25rem' }}>
+                      {activeZoning.normative_amendments.map((am) => {
+                        const isMatch = am.applicability_status === 'posible_coincidencia_pendiente_catastro'
+                        const isBase = am.applicability_status === 'base_vigente'
+                        const isGeneral = am.applicability_status === 'alcance_general_reglamentario'
+                        return (
+                          <article
+                            key={am.ordinance}
+                            data-testid={`zoning-amendment-${am.ordinance}`}
+                            style={{
+                              background: isMatch ? '#fffbeb' : isBase ? '#f0f9ff' : '#f8fafc',
+                              border: `1px solid ${isMatch ? '#f59e0b' : isBase ? '#7dd3fc' : '#cbd5e1'}`,
+                              borderRadius: '6px',
+                              padding: '0.6rem 0.75rem',
+                              fontSize: '0.82rem',
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.35rem' }}>
+                              <strong>{am.ordinance} ({am.publication_date})</strong>
+                              <span
+                                style={{
+                                  fontSize: '0.74rem',
+                                  fontWeight: 700,
+                                  color: isMatch ? '#92400e' : isBase ? '#0369a1' : isGeneral ? '#4338ca' : '#475569',
+                                }}
+                              >
+                                {isMatch
+                                  ? 'Posible coincidencia de sector/vía — requiere cotejo catastral'
+                                  : isBase
+                                    ? 'Norma base vigente (no desactivada globalmente)'
+                                    : isGeneral
+                                      ? 'Modificación / rectificación reglamentaria general'
+                                      : 'Modificación parcial específica — no generalizable a todo El Tambo'}
+                              </span>
+                            </div>
+                            <div style={{ color: '#334155', marginTop: '0.18rem' }}>
+                              <strong>Relación y alcance:</strong> {am.relation_to_base} — {am.scope_summary}
+                            </div>
+                            <div style={{ marginTop: '0.2rem', fontSize: '0.78rem' }}>
+                              Fuente verificable:{' '}
+                              <a href={am.official_url} target="_blank" rel="noreferrer">
+                                {am.official_url}
+                              </a>
+                            </div>
+                          </article>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {activeZoning.evidence && activeZoning.evidence.length > 0 && (
+                  <div style={{ display: 'grid', gap: '0.5rem' }} data-testid="zoning-evidence-list">
+                    <strong style={{ fontSize: '0.88rem', color: '#0f172a' }}>
+                      Sustento documental y territorial consultado ({activeZoning.evidence.length})
+                    </strong>
+                    {activeZoning.evidence.map((ev, idx) => (
+                      <article
+                        key={`${ev.locator}-${idx}`}
+                        style={{
+                          background: '#f8fafc',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '6px',
+                          padding: '0.75rem',
+                          fontSize: '0.84rem',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.35rem' }}>
+                          <strong>{ev.document} (v. {ev.version})</strong>
+                          <span style={{ fontSize: '0.76rem', color: ev.is_spatial_classification ? '#166534' : '#475569', fontWeight: 600 }}>
+                            {ev.is_spatial_classification
+                              ? 'Sustento espacial / zonal'
+                              : 'Marco normativo documental (sin polígono predial)'}
+                          </span>
+                        </div>
+                        <div style={{ color: '#334155', marginTop: '0.2rem' }}>
+                          <strong>Sección / Localizador:</strong> {ev.locator}
+                        </div>
+                        <p style={{ margin: '0.25rem 0 0', color: '#475569', lineHeight: 1.4 }}>{ev.excerpt}</p>
+                        {ev.official_url && (
+                          <div style={{ marginTop: '0.25rem', fontSize: '0.78rem', color: '#64748b' }}>
+                            <strong>Autoridad:</strong> {ev.authority ?? 'MPH'} · Fuente oficial:{' '}
+                            <a href={ev.official_url} target="_blank" rel="noreferrer">
+                              {ev.official_url}
+                            </a>
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                )}
+
+                <TechnicalDetails data={activeZoning} />
+              </div>
+            )}
           </section>
 
           {/* PMV 2 - HU1.12: Resumen Unificado de Evaluación Multidimensional */}

@@ -78,7 +78,8 @@ def test_completion_processor_idempotency_on_retries():
     project = service.get_project(PROJECT_C_ID)
     project_version_id = project["project_version_id"]
 
-    # Contar checkpoints existentes antes de reintentos
+    eval_id = uuid4()
+    event_id = str(uuid4())
     with psycopg.connect(db_url, row_factory=dict_row) as conn:
         initial_count = conn.execute(
             """SELECT COUNT(*) AS total FROM evaluation_checkpoints
@@ -91,7 +92,6 @@ def test_completion_processor_idempotency_on_retries():
         criteria_row = conn.execute(
             "SELECT id FROM criteria_versions WHERE status='active' LIMIT 1"
         ).fetchone()
-        eval_id = uuid4()
         conn.execute(
             """INSERT INTO evaluations (id, project_version_id, criteria_version_id,
             requested_by_user_id, status, idempotency_key)
@@ -99,38 +99,44 @@ def test_completion_processor_idempotency_on_retries():
             (eval_id, project_version_id, criteria_row["id"], PLANNER_ID, str(uuid4())),
         )
 
-    # Ejecutar procesador de finalización dos veces (simulando reintento Celery/inbox)
-    processor = CompletionProcessor(db_url=db_url)
-    payload = {
-        "event_id": str(uuid4()),
-        "evaluation_id": str(eval_id),
-        "economic_assessment_id": str(uuid4()),
-        "cost_per_beneficiary_pen": "250.00",
-        "score_0_100": "80.00",
-        "explanation": "Evaluación económica de prueba",
-        "algorithm_version": "v1.0",
-    }
-    processor.process(payload)
-    processor.process(payload)
+    try:
+        # Ejecutar procesador de finalización dos veces (simulando reintento Celery/inbox)
+        processor = CompletionProcessor(db_url=db_url)
+        payload = {
+            "event_id": event_id,
+            "evaluation_id": str(eval_id),
+            "economic_assessment_id": str(uuid4()),
+            "cost_per_beneficiary_pen": "250.00",
+            "score_0_100": "80.00",
+            "explanation": "Evaluación económica de prueba",
+            "algorithm_version": "v1.0",
+        }
+        processor.process(payload)
+        processor.process(payload)
 
-    # Verificar que el estado no avanzó a completed/evaluated y no se duplicó el checkpoint
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        eval_row = conn.execute(
-            "SELECT status FROM evaluations WHERE id = %s", (eval_id,)
-        ).fetchone()
-        assert eval_row["status"] == "pending_review"
+        # Verificar que el estado no avanzó a completed/evaluated y no se duplicó el checkpoint
+        with psycopg.connect(db_url, row_factory=dict_row) as conn:
+            eval_row = conn.execute(
+                "SELECT status FROM evaluations WHERE id = %s", (eval_id,)
+            ).fetchone()
+            assert eval_row["status"] == "pending_review"
 
-        proj_row = conn.execute(
-            "SELECT status FROM projects WHERE id = %s", (PROJECT_C_ID,)
-        ).fetchone()
-        assert proj_row["status"] == "pending_review"
+            proj_row = conn.execute(
+                "SELECT status FROM projects WHERE id = %s", (PROJECT_C_ID,)
+            ).fetchone()
+            assert proj_row["status"] == "pending_review"
 
-        final_count = conn.execute(
-            """SELECT COUNT(*) AS total FROM evaluation_checkpoints
-            WHERE project_version_id = %s AND risk_source = 'environmental'""",
-            (project_version_id,),
-        ).fetchone()["total"]
-        assert final_count == initial_count
+            final_count = conn.execute(
+                """SELECT COUNT(*) AS total FROM evaluation_checkpoints
+                WHERE project_version_id = %s AND risk_source = 'environmental'""",
+                (project_version_id,),
+            ).fetchone()["total"]
+            assert final_count == initial_count
+    finally:
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            conn.execute("DELETE FROM inbox_events WHERE event_id = %s", (UUID(event_id),))
+            conn.execute("UPDATE evaluation_checkpoints SET evaluation_id = NULL WHERE evaluation_id = %s", (eval_id,))
+            conn.execute("DELETE FROM evaluations WHERE id = %s", (eval_id,))
 
 
 def test_submit_human_approval_strictly_blocked_while_paused():
@@ -256,36 +262,41 @@ def test_request_evaluation_high_risk_idempotency_returns_same_eval_without_fake
     idemp_key = f"idemp-risk-test-{uuid4()}"
 
     res1 = service.request_evaluation(v_id, PLANNER_ID, idemp_key)
-    assert res1["status"] == "pending_review"
-    assert res1["status_label"] == "Pendiente de revisión"
-    assert res1["duplicated"] is False
-    assert res1["event_id"] is None
-    assert res1["publication_pending"] is False
-    assert res1["checkpoint"] is not None
-    assert res1["checkpoint"]["status"] == "pending_review"
-    assert res1["checkpoint"]["risk_level"] == "high"
-
     eval_id_1 = res1["evaluation_id"]
+    try:
+        assert res1["status"] == "pending_review"
+        assert res1["status_label"] == "Pendiente de revisión"
+        assert res1["duplicated"] is False
+        assert res1["event_id"] is None
+        assert res1["publication_pending"] is False
+        assert res1["checkpoint"] is not None
+        assert res1["checkpoint"]["status"] == "pending_review"
+        assert res1["checkpoint"]["risk_level"] == "high"
 
-    # Segundo intento con exactamente la misma Idempotency-Key
-    res2 = service.request_evaluation(v_id, PLANNER_ID, idemp_key)
-    assert res2["evaluation_id"] == eval_id_1
-    assert res2["status"] == "pending_review"
-    assert res2["status_label"] == "Pendiente de revisión"
-    assert res2["duplicated"] is True
-    assert res2["event_id"] is None  # Estrictamente None, nunca un UUID inventado
-    assert res2["publication_pending"] is False
-    assert res2["checkpoint"] is not None
-    assert res2["checkpoint"]["status"] == "pending_review"
+        # Segundo intento con exactamente la misma Idempotency-Key
+        res2 = service.request_evaluation(v_id, PLANNER_ID, idemp_key)
+        assert res2["evaluation_id"] == eval_id_1
+        assert res2["status"] == "pending_review"
+        assert res2["status_label"] == "Pendiente de revisión"
+        assert res2["duplicated"] is True
+        assert res2["event_id"] is None  # Estrictamente None, nunca un UUID inventado
+        assert res2["publication_pending"] is False
+        assert res2["checkpoint"] is not None
+        assert res2["checkpoint"]["status"] == "pending_review"
 
-    # Verificar que no se creó una segunda evaluación en la BD
-    db_url = get_test_db_url()
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        count = conn.execute(
-            "SELECT count(*) AS total FROM evaluations WHERE idempotency_key = %s",
-            (idemp_key,),
-        ).fetchone()["total"]
-        assert count == 1
+        # Verificar que no se creó una segunda evaluación en la BD
+        db_url = get_test_db_url()
+        with psycopg.connect(db_url, row_factory=dict_row) as conn:
+            count = conn.execute(
+                "SELECT count(*) AS total FROM evaluations WHERE idempotency_key = %s",
+                (idemp_key,),
+            ).fetchone()["total"]
+            assert count == 1
+    finally:
+        with psycopg.connect(get_test_db_url(), autocommit=True) as conn:
+            conn.execute("DELETE FROM audit_events WHERE entity_id = %s", (eval_id_1,))
+            conn.execute("UPDATE evaluation_checkpoints SET evaluation_id = NULL WHERE evaluation_id = %s", (eval_id_1,))
+            conn.execute("DELETE FROM evaluations WHERE id = %s", (eval_id_1,))
 
 
 def test_completion_processor_late_event_on_paused_evaluation_does_not_expose_result():
@@ -298,6 +309,7 @@ def test_completion_processor_late_event_on_paused_evaluation_does_not_expose_re
 
     # Crear una evaluación en pending_review
     eval_id = uuid4()
+    late_event_id = uuid4()
     with psycopg.connect(db_url, row_factory=dict_row) as conn:
         criteria_row = conn.execute(
             "SELECT id FROM criteria_versions WHERE status='active' LIMIT 1"
@@ -309,63 +321,68 @@ def test_completion_processor_late_event_on_paused_evaluation_does_not_expose_re
             (eval_id, v_id, criteria_row["id"], PLANNER_ID, str(uuid4())),
         )
 
-    # Llega un evento de finalización económico tardío
-    late_event_id = uuid4()
-    processor = CompletionProcessor(db_url=db_url)
-    payload = {
-        "event_id": str(late_event_id),
-        "evaluation_id": str(eval_id),
-        "economic_assessment_id": str(uuid4()),
-        "cost_per_beneficiary_pen": "300.00",
-        "score_0_100": "75.00",
-        "explanation": "Resultado económico tardío que no debe publicarse",
-        "algorithm_version": "v1.0",
-    }
+    try:
+        # Llega un evento de finalización económico tardío
+        processor = CompletionProcessor(db_url=db_url)
+        payload = {
+            "event_id": str(late_event_id),
+            "evaluation_id": str(eval_id),
+            "economic_assessment_id": str(uuid4()),
+            "cost_per_beneficiary_pen": "300.00",
+            "score_0_100": "75.00",
+            "explanation": "Resultado económico tardío que no debe publicarse",
+            "algorithm_version": "v1.0",
+        }
 
-    processor.process(payload)
+        processor.process(payload)
 
-    # Comprobar en base de datos:
-    # 1. inbox_events registró el evento para evitar reprocesamiento
-    # 2. NO se insertó en economic_result_projections
-    # 3. La evaluación sigue en pending_review
-    # 4. El proyecto sigue en pending_review
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        inbox = conn.execute(
-            "SELECT * FROM inbox_events WHERE event_id = %s", (late_event_id,)
-        ).fetchone()
-        assert inbox is not None
+        # Comprobar en base de datos:
+        # 1. inbox_events registró el evento para evitar reprocesamiento
+        # 2. NO se insertó en economic_result_projections
+        # 3. La evaluación sigue en pending_review
+        # 4. El proyecto sigue en pending_review
+        with psycopg.connect(db_url, row_factory=dict_row) as conn:
+            inbox = conn.execute(
+                "SELECT * FROM inbox_events WHERE event_id = %s", (late_event_id,)
+            ).fetchone()
+            assert inbox is not None
 
-        proj_row = conn.execute(
-            "SELECT count(*) AS total FROM economic_result_projections WHERE evaluation_id = %s",
-            (eval_id,),
-        ).fetchone()
-        assert proj_row["total"] == 0
+            proj_row = conn.execute(
+                "SELECT count(*) AS total FROM economic_result_projections WHERE evaluation_id = %s",
+                (eval_id,),
+            ).fetchone()
+            assert proj_row["total"] == 0
 
-        ev_row = conn.execute(
-            "SELECT status FROM evaluations WHERE id = %s", (eval_id,)
-        ).fetchone()
-        assert ev_row["status"] == "pending_review"
+            ev_row = conn.execute(
+                "SELECT status FROM evaluations WHERE id = %s", (eval_id,)
+            ).fetchone()
+            assert ev_row["status"] == "pending_review"
 
-        p_row = conn.execute(
-            "SELECT status FROM projects WHERE id = %s", (PROJECT_C_ID,)
-        ).fetchone()
-        assert p_row["status"] == "pending_review"
+            p_row = conn.execute(
+                "SELECT status FROM projects WHERE id = %s", (PROJECT_C_ID,)
+            ).fetchone()
+            assert p_row["status"] == "pending_review"
 
-    # 5. get_evaluation devuelve result=None
-    eval_data = service.get_evaluation(eval_id)
-    assert eval_data["status"] == "pending_review"
-    assert eval_data["status_label"] == "Pendiente de revisión"
-    assert eval_data["result"] is None
-    assert eval_data["checkpoint"] is not None
+        # 5. get_evaluation devuelve result=None
+        eval_data = service.get_evaluation(eval_id)
+        assert eval_data["status"] == "pending_review"
+        assert eval_data["status_label"] == "Pendiente de revisión"
+        assert eval_data["result"] is None
+        assert eval_data["checkpoint"] is not None
 
-    # Reintentar el mismo payload: debe descartarse silenciosamente por idempotencia de inbox
-    processor.process(payload)
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        proj_count = conn.execute(
-            "SELECT count(*) AS total FROM economic_result_projections WHERE evaluation_id = %s",
-            (eval_id,),
-        ).fetchone()["total"]
-        assert proj_count == 0
+        # Reintentar el mismo payload: debe descartarse silenciosamente por idempotencia de inbox
+        processor.process(payload)
+        with psycopg.connect(db_url, row_factory=dict_row) as conn:
+            proj_count = conn.execute(
+                "SELECT count(*) AS total FROM economic_result_projections WHERE evaluation_id = %s",
+                (eval_id,),
+            ).fetchone()["total"]
+            assert proj_count == 0
+    finally:
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            conn.execute("DELETE FROM inbox_events WHERE event_id = %s", (late_event_id,))
+            conn.execute("UPDATE evaluation_checkpoints SET evaluation_id = NULL WHERE evaluation_id = %s", (eval_id,))
+            conn.execute("DELETE FROM evaluations WHERE id = %s", (eval_id,))
 
 
 def test_full_version_lifecycle_v1_high_risk_v2_mitigated_completes_without_inherited_pause():

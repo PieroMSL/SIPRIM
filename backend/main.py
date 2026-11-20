@@ -141,7 +141,14 @@ def create_app() -> FastAPI:
     async def expediente_pmv1_incompleto_handler(
         request: Request, exc: ExpedientePMV1IncompletoError
     ) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"detail": str(exc), "missing_fields": exc.campos_faltantes})
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "missing_fields": exc.campos_faltantes,
+                "missing_field_labels": exc.campos_legibles,
+            },
+        )
 
     @application.exception_handler(ConfiguracionPMV1Error)
     async def configuracion_pmv1_handler(

@@ -20,6 +20,8 @@ interface ExpedienteFormProps {
   onReset: () => void
   submitLabel?: string
   resetLabel?: string
+  onSaveDraft?: () => void
+  draftLabel?: string
   physicalFile?: File | null
   onPhysicalFileChange?: (file: File | null) => void
   physicalFileError?: string | null
@@ -35,6 +37,8 @@ export function ExpedienteForm({
   onReset,
   submitLabel = 'Guardar proyecto',
   resetLabel = 'Limpiar formulario',
+  onSaveDraft,
+  draftLabel = 'Guardar borrador incompleto',
   physicalFile = null,
   onPhysicalFileChange,
   physicalFileError = null,
@@ -81,6 +85,24 @@ export function ExpedienteForm({
           placeholder="Objetivo, alcance y beneficios esperados para la población."
           error={fieldErrors.descripcion}
           onChange={(e) => onFieldChange('descripcion', e.target.value)}
+        />
+
+        <FormField
+          label="Ubicación territorial *"
+          value={form.ubicacion ?? ''}
+          maxLength={300}
+          placeholder="Ej. Jr. Huancavelica cdra. 4, El Tambo - Huancayo"
+          error={fieldErrors.ubicacion}
+          onChange={(e) => onFieldChange('ubicacion', e.target.value)}
+        />
+
+        <FormField
+          label="Uso de suelo propuesto *"
+          value={form.usoSueloPropuesto ?? ''}
+          maxLength={150}
+          placeholder="Ej. Infraestructura urbana / Equipamiento recreativo"
+          error={fieldErrors.usoSueloPropuesto}
+          onChange={(e) => onFieldChange('usoSueloPropuesto', e.target.value)}
         />
 
         <FormField
@@ -159,6 +181,16 @@ export function ExpedienteForm({
         <button type="submit" className="btn btn-primary" disabled={loading}>
           {loading ? 'Guardando…' : submitLabel}
         </button>
+        {onSaveDraft && (
+          <button
+            type="button"
+            className="btn btn-secondary"
+            disabled={loading}
+            onClick={onSaveDraft}
+          >
+            {loading ? 'Guardando…' : draftLabel}
+          </button>
+        )}
         <button type="button" className="btn btn-ghost" onClick={onReset}>
           {resetLabel}
         </button>

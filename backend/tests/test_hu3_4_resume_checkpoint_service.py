@@ -757,3 +757,97 @@ def test_hu3_4_resume_executes_pending_economic_stage_and_creates_projection(ser
             conn.execute("DELETE FROM project_environmental_records WHERE project_id = %s", (proj_id,))
             conn.execute("DELETE FROM project_versions WHERE project_id = %s", (proj_id,))
             conn.execute("DELETE FROM projects WHERE id = %s", (proj_id,))
+
+
+def test_hu3_4_list_decisions_deterministic_tiebreak_matches_resume_gate(service):
+    """
+    CA-HU3.4-02: Ante decisiones con mismo decided_at y created_at, list_checkpoint_decisions
+    desempata por id DESC en la misma ordenacion determinista que resume_project_checkpoint,
+    de modo que si la vigente es request_correction, aparece primera y el servidor rechaza reanudar.
+    """
+    settings = get_settings()
+    db_url = settings.platform_db_url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+    proj_id = uuid4()
+    v1_id = uuid4()
+    cp_id = uuid4()
+    code = f"PRY-TIE-{uuid4().hex[:6]}"
+    tied_ts = datetime(2026, 11, 19, 15, 0, 0, tzinfo=timezone.utc)
+    dec_low_id = UUID("11111111-1111-4000-a000-000000000001")
+    dec_high_id = UUID("ffffffff-ffff-4fff-afff-ffffffffffff")
+
+    try:
+        with psycopg.connect(db_url) as conn, conn.transaction():
+            conn.execute(
+                "INSERT INTO projects (id, code, created_by_user_id, status) VALUES (%s, %s, %s, 'pending_review')",
+                (proj_id, code, PLANNER_ID),
+            )
+            conn.execute(
+                """
+                INSERT INTO project_versions
+                (id, project_id, version_number, title, description, location_description, proposed_land_use,
+                 territorial_data_origin, estimated_budget_pen, beneficiaries_count, created_by_user_id)
+                VALUES (%s, %s, 1, 'Proyecto desempate determinista', 'Desc', 'El Tambo', 'Parque', 'public', 120000, 400, %s)
+                """,
+                (v1_id, proj_id, PLANNER_ID),
+            )
+            conn.execute(
+                """
+                INSERT INTO evaluation_checkpoints
+                (id, project_id, project_version_id, checkpoint_type, status, reason, risk_source, risk_level, details)
+                VALUES (%s, %s, %s, 'high_risk_pause', 'pending_review', 'Pausa con empate de hora', 'environmental', 'high', '{}')
+                """,
+                (cp_id, proj_id, v1_id),
+            )
+
+        # Registrar primero approve_continue y luego request_correction, luego igualar decided_at/created_at e IDs deterministas
+        d1 = service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Prueba",
+            actor_email="gerente@siprim.test",
+            decision="approve_continue",
+            justification="Aprobacion inicial empatada en marca temporal.",
+            conditions=None,
+            idempotency_key=f"tie-app-{uuid4()}",
+        )
+        d2 = service.register_checkpoint_decision(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            actor_name="Gerente Prueba",
+            actor_email="gerente@siprim.test",
+            decision="request_correction",
+            justification="Correccion posterior con prioridad por id DESC.",
+            conditions="Adjuntar estudio hidrologico complementario.",
+            idempotency_key=f"tie-corr-{uuid4()}",
+        )
+
+        with psycopg.connect(db_url) as conn, conn.transaction():
+            conn.execute(
+                "UPDATE checkpoint_review_decisions SET id = %s, decided_at = %s, created_at = %s WHERE id = %s",
+                (dec_low_id, tied_ts, tied_ts, d1["decision_id"]),
+            )
+            conn.execute(
+                "UPDATE checkpoint_review_decisions SET id = %s, decided_at = %s, created_at = %s WHERE id = %s",
+                (dec_high_id, tied_ts, tied_ts, d2["decision_id"]),
+            )
+
+        listed = service.list_checkpoint_decisions(proj_id)["decisions"]
+        assert len(listed) == 2
+        assert listed[0]["decision_id"] == dec_high_id
+        assert listed[0]["decision"] == "request_correction"
+
+        with pytest.raises(ConfiguracionPMV1Error, match="solicita corrección"):
+            service.resume_project_checkpoint(
+                project_id=proj_id,
+                actor_id=PLANNER_ID,
+                justification="Intento ignorando correccion empatada.",
+                conditions=None,
+                idempotency_key=f"tie-res-{uuid4()}",
+            )
+    finally:
+        with psycopg.connect(db_url) as conn, conn.transaction():
+            conn.execute("DELETE FROM checkpoint_review_decisions WHERE project_id = %s", (proj_id,))
+            conn.execute("DELETE FROM evaluation_checkpoints WHERE project_id = %s", (proj_id,))
+            conn.execute("DELETE FROM project_versions WHERE project_id = %s", (proj_id,))
+            conn.execute("DELETE FROM projects WHERE id = %s", (proj_id,))

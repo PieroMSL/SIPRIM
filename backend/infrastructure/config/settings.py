@@ -17,6 +17,10 @@ class Settings(BaseSettings):
         default=False,
         description="Habilita modo demostracion explicitamente para consulta normativa sin PostgreSQL. Desactivado por defecto.",
     )
+    enable_synthetic_zoning_rehearsal: bool = Field(
+        default=False,
+        description="Habilita exclusivamente en entornos de prueba tecnica el ensayo espacial con capas sinteticas etiquetadas. Desactivado por defecto.",
+    )
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/siprim"
     auth_db_url: str = (
         "postgresql+psycopg://auth_app:auth_dev_only@localhost:5432/auth_db"

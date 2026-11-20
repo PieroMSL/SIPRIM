@@ -21,8 +21,18 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from backend.application.dto.pmv1_dto import PMV1ProjectCreate, PertEstimateCreate
+from backend.application.dto.pmv1_dto import (
+    PMV1ProjectCreate,
+    PMV1ProjectUpdate,
+    PertEstimateCreate,
+    ProcurementAntecedentUpsert,
+)
 from backend.application.services.prioritization_pdf_service import build_prioritization_pdf
+from backend.application.services.zoning_catalog import (
+    OfficialZoningSourceMetadata,
+    ZoningSourceValidator,
+    build_synthetic_rehearsal_zoning_package,
+)
 from backend.infrastructure.config.settings import get_settings
 from backend.domain.exceptions.pmv1_exceptions import (
     AccesoDenegadoError,
@@ -560,16 +570,27 @@ class NormativeSearchEngine:
 
         return round(score, 2)
 
+    GENERIC_META_WORDS: ClassVar[set[str]] = {
+        "ley", "leyes", "norma", "normas", "normativa", "normativo", "normativas",
+        "reglamento", "reglamentos", "decreto", "supremo", "legislativo",
+        "articulo", "artículo", "articulos", "artículos", "seccion", "sección",
+        "capitulo", "capítulo", "titulo", "título", "vigente", "vigentes",
+        "actual", "actuales", "consulta", "consultar", "publico", "público",
+        "publica", "pública", "publicos", "públicos", "publicas", "públicas",
+        "sistema", "proyecto", "proyectos", "general", "peru", "perú", "estado",
+    }
+
     @classmethod
     def is_relevant(
         cls, chunk: dict[str, Any], query: str, keywords: list[str]
     ) -> bool:
-        """Evita resultados espurios cuando solo coincide una palabra incidental.
+        """Evita resultados espurios o coincidencias superficiales sin sustento (HU2.1).
 
-        Una consulta por identificador o frase exacta siempre es relevante. Para
-        consultas libres con varias palabras se exige que coincida, como mínimo,
-        la mitad de los términos significativos. Así una entrada sin sustento no
-        produce normas ni alertas ficticias (CA-HU2.1-03 / CA-HU2.3-02).
+        Una consulta por identificador exacto (p. ej. "PDUPDM-02") o frase literal
+        específica (>= 5 caracteres y no meramente genérica) siempre es relevante.
+        Para consultas libres, separa términos meta/genéricos ("ley", "reglamento",
+        "norma", etc.) de las palabras sustantivas y exige cobertura real para no
+        devolver normas ante consultas ajenas o coincidencias débiles (CA-HU2.1-03).
         """
         normalized_query = query.strip().lower()
         searchable_parts = (
@@ -581,22 +602,33 @@ class NormativeSearchEngine:
         )
         lowered_parts = tuple(part.lower() for part in searchable_parts)
 
-        if normalized_query and (
-            normalized_query == lowered_parts[0]
-            or any(normalized_query in part for part in lowered_parts[1:])
+        if normalized_query and normalized_query == lowered_parts[0]:
+            return True
+
+        if (
+            len(normalized_query) >= 5
+            and normalized_query not in cls.GENERIC_META_WORDS
+            and any(normalized_query in part for part in lowered_parts[1:])
         ):
             return True
 
         if not keywords:
             return False
 
+        substantive = [kw for kw in keywords if kw not in cls.GENERIC_META_WORDS]
+        if not substantive:
+            return False
+
         searchable_tokens: set[str] = set()
         for part in lowered_parts:
             searchable_tokens.update(re.findall(r"[\wáéíóúüñ]+", part))
 
-        matched = {keyword for keyword in keywords if keyword in searchable_tokens}
-        required_matches = 1 if len(keywords) <= 2 else (len(keywords) + 1) // 2
-        return len(matched) >= required_matches
+        matched_substantive = {kw for kw in substantive if kw in searchable_tokens}
+        if len(substantive) == 1:
+            return len(matched_substantive) == 1
+
+        required_matches = math.ceil(len(substantive) * 0.6)
+        return len(matched_substantive) >= required_matches
 
 
 
@@ -945,6 +977,491 @@ class LegalAssessmentEngine:
             "evaluated_at": datetime.now(timezone.utc),
             "is_simulated_corpus": is_any_simulated,
         }
+
+
+class ProcurementVerificationEngine:
+    """Motor determinista de verificación preliminar de Ley de Contrataciones Públicas (HU1.10).
+
+    Normativa vigente contrastada contra el Compendio Oficial OECE (consultado 2026-11-20):
+    - Ley N.° 32069 (vigente desde 22/04/2025; texto SPIJ/OECE act. 19/07/2026 con Leyes
+      32103, 32185, 32187, 32515, D.Leg. 1715 y Ley 32732).
+    - Reglamento D.S. N.° 009-2025-EF (vigente desde 22/04/2025; act. 26/10/2026 con
+      D.S. N.° 001-2026-EF y D.S. N.° 222-2026-EF).
+    - UIT 2026 oficial: S/ 5,500.00 (D.S. N.° 301-2025-EF) -> tope 8 UIT contratos menores = S/ 44,000.00.
+
+    Principios estrictos HU1.10:
+    - NUNCA infiere cumplimiento contractual a partir de title o description.
+    - Excluye fuentes históricas/sustituidas (in_force=False) o simuladas (data_origin='simulated').
+    - Si faltan antecedentes contractuales o sustento normativo vigente, responde 'requires_review'
+      indicando qué falta (preliminary_compliant=None).
+    - Ante posible incompatibilidad, señala el requisito y la remite a LEGAL_ADVISOR sin certificar infracción.
+    """
+
+    UIT_2026_PEN = Decimal("5500.00")
+    MINOR_CONTRACT_MAX_UIT = 8
+    MINOR_CONTRACT_MAX_PEN = Decimal("44000.00")
+    CONSULTED_AT = "2026-11-20"
+    OECE_COMPENDIUM_URL = (
+        "https://www.gob.pe/institucion/oece/colecciones/45029-ley-n-32069-ley-general-de-contrataciones-publicas"
+    )
+    REGIME_LABELS: ClassVar[dict[str, str]] = {
+        "ley_32069": "Ley N.° 32069 y D.S. N.° 009-2025-EF (Régimen general vigente)",
+        "ley_30225_historica": "Ley N.° 30225 (Régimen anterior sustituido el 22/04/2025)",
+        "ley_26850_historica": "Ley N.° 26850 (Norma histórica derogada)",
+        "regimen_especial": "Régimen especial de contratación",
+        "administracion_directa": "Ejecución por administración directa",
+    }
+    OBJECT_LABELS: ClassVar[dict[str, str]] = {
+        "obra": "Obra pública",
+        "bien": "Bienes",
+        "servicio": "Servicios",
+        "consultoria_obra": "Consultoría de obra",
+    }
+    PHASE_LABELS: ClassVar[dict[str, str]] = {
+        "programacion_cmn": "Programación Multianual (PMBSO / CMN)",
+        "actuaciones_preparatorias": "Actuaciones preparatorias",
+        "seleccion": "Fase de selección",
+        "ejecucion_contractual": "Ejecución contractual",
+    }
+    PROCEDURE_LABELS: ClassVar[dict[str, str]] = {
+        "licitacion_publica": "Licitación pública",
+        "concurso_publico": "Concurso público",
+        "modalidad_abreviada": "Modalidad abreviada de procedimiento competitivo",
+        "subasta_inversa_electronica": "Subasta inversa electrónica",
+        "comparacion_precios": "Comparación de precios",
+        "contrato_menor": "Contrato menor (<= 8 UIT)",
+        "contratacion_no_competitiva": "Procedimiento no competitivo / Contratación directa",
+    }
+
+    @classmethod
+    def _serialize_source(cls, chunk: dict[str, Any]) -> dict[str, Any]:
+        in_force = bool(chunk.get("in_force", False))
+        origin = str(chunk.get("data_origin") or "simulated")
+        if not in_force:
+            note = "Histórica / sustituida: conservada solo como antecedente y excluida de conformidad vigente."
+        elif origin not in ("public", "official"):
+            note = f"Origen '{origin}': excluido como fuente normativa oficial vinculante."
+        else:
+            note = "Vigente y verificable en Compendio OECE / MEF."
+        eff = chunk.get("effective_from")
+        con = chunk.get("consulted_at")
+        return {
+            "fragment_id": str(chunk["id"]),
+            "document_name": str(chunk.get("document_name") or ""),
+            "short_code": str(chunk.get("short_code") or ""),
+            "version": str(chunk.get("version") or ""),
+            "in_force": in_force,
+            "data_origin": origin,
+            "effective_from": eff.isoformat() if hasattr(eff, "isoformat") else (str(eff) if eff else None),
+            "consulted_at": con.isoformat() if hasattr(con, "isoformat") else (str(con) if con else cls.CONSULTED_AT),
+            "amendments_summary": chunk.get("amendments_summary"),
+            "official_url": chunk.get("official_url") or cls.OECE_COMPENDIUM_URL,
+            "status_note": note,
+        }
+
+    @classmethod
+    def evaluate(
+        cls,
+        *,
+        project: dict[str, Any],
+        antecedent: dict[str, Any] | None,
+        all_chunks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        active_by_id: dict[str, dict[str, Any]] = {}
+        active_sources: list[dict[str, Any]] = []
+        excluded_sources: list[dict[str, Any]] = []
+
+        for c in all_chunks:
+            cid = str(c["id"])
+            serialized = cls._serialize_source(c)
+            in_force = bool(c.get("in_force", False))
+            origin = str(c.get("data_origin") or "simulated")
+            version_str = str(c.get("version") or "").lower()
+            is_stale_2024_seed = (
+                cid.startswith("LEY32069-")
+                and ("2024-v1" in version_str or "histor" in version_str)
+            )
+            if in_force and origin in ("public", "official") and not is_stale_2024_seed:
+                active_by_id[cid] = c
+                active_sources.append(serialized)
+            else:
+                if is_stale_2024_seed and in_force:
+                    serialized["status_note"] = (
+                        "Versión referencial '2024-v1' anterior a entrada en vigor (22/04/2025) y modificatorias Ley 32187; excluida por desactualizada."
+                    )
+                excluded_sources.append(serialized)
+
+        active_ley32069 = [c for cid, c in active_by_id.items() if cid.startswith("LEY32069-")]
+        active_reg = [c for cid, c in active_by_id.items() if cid.startswith("DS009-2025-")]
+
+        missing_fields: list[str] = []
+        examined: list[dict[str, Any]] = []
+
+        if not active_ley32069 or not active_reg:
+            missing_fields.append(
+                "Sustento normativo vigente y actualizado de la Ley N.° 32069 y su Reglamento D.S. N.° 009-2025-EF en normative_documents"
+            )
+
+        rec = antecedent or {}
+        if rec.get("data_origin") == "simulated":
+            missing_fields.append(
+                "Origen verificable de antecedentes contractuales (los datos ingresados figuran como simulados)"
+            )
+
+        regime = (rec.get("contracting_regime") or "").strip().lower() or None
+        obj = (rec.get("contract_object") or "").strip().lower() or None
+        phase = (rec.get("contracting_phase") or "").strip().lower() or None
+        proc = (rec.get("selection_procedure") or "").strip().lower() or None
+        req_def = rec.get("requirement_defined")
+        in_cmn = rec.get("in_cmn_and_viability")
+        budget_cert = rec.get("budget_certification_declared")
+        pladicop = rec.get("pladicop_registration_planned")
+        no_frac = rec.get("no_fractionation_declared")
+        doc_ref = (rec.get("supporting_document_ref") or "").strip() or None
+
+        if not regime:
+            missing_fields.append("Régimen de contratación aplicable")
+        if not obj:
+            missing_fields.append("Objeto contractual (obra, bien, servicio o consultoría)")
+        if not phase:
+            missing_fields.append("Fase contractual (PMBSO/CMN, actuaciones preparatorias, selección o ejecución)")
+        if not proc:
+            missing_fields.append("Procedimiento o modalidad de contratación prevista")
+        if req_def is None:
+            missing_fields.append("Confirmación de requerimiento técnico / expediente de obra definido (Art. 46)")
+        if in_cmn is None:
+            missing_fields.append("Confirmación de inclusión en CMN y viabilidad Invierte.pe (Reg. Arts. 46.1.c / 54.3)")
+        if budget_cert is None:
+            missing_fields.append("Confirmación de certificación o previsión presupuestal (Reg. Art. 54.2.f)")
+        if pladicop is None:
+            missing_fields.append("Confirmación de registro en PLADICOP (Art. 41 mod. Ley 32187)")
+        if no_frac is None:
+            missing_fields.append("Confirmación de ausencia de fraccionamiento (Art. 50 / Reg. Art. 45)")
+        if not doc_ref:
+            missing_fields.append("Documento o referencia contractual verificable (ej. TdR, EETT, Informe DEC o PAC/CMN)")
+
+        def _chunk_meta(cid: str, fallback_art: str) -> dict[str, Any]:
+            c = active_by_id.get(cid)
+            if not c:
+                return {
+                    "norm_id": None,
+                    "norm_name": "Fuente normativa vigente no disponible en repositorio",
+                    "norm_version": None,
+                    "article_or_section": None,
+                    "fragment_excerpt": None,
+                    "official_url": cls.OECE_COMPENDIUM_URL,
+                    "consulted_at": cls.CONSULTED_AT,
+                    "amendments_note": None,
+                }
+            con = c.get("consulted_at")
+            return {
+                "norm_id": str(c["id"]),
+                "norm_name": str(c.get("document_name") or ""),
+                "norm_version": str(c.get("version") or ""),
+                "article_or_section": fallback_art,
+                "fragment_excerpt": str(c.get("content") or ""),
+                "official_url": str(c.get("official_url") or cls.OECE_COMPENDIUM_URL),
+                "consulted_at": con.isoformat() if hasattr(con, "isoformat") else cls.CONSULTED_AT,
+                "amendments_note": c.get("amendments_summary"),
+            }
+
+        # Requisito 1: Régimen normativo aplicable y exclusión de normas sustituidas
+        meta_r1 = _chunk_meta("LEY32069-01", "Art. 5.1 (Vigencia 22/04/2025 - D.S. 009-2025-EF)")
+        if not regime:
+            r1_status = "missing_data"
+            r1_label = "Falta dato"
+            r1_ev = "Sin régimen contractual declarado en el expediente (no se infiere del título ni de la descripción)."
+            r1_comp = "Se requiere declarar expresamente el régimen de contratación aplicable."
+        elif regime in ("ley_30225_historica", "ley_26850_historica"):
+            r1_status = "possible_incompatibility"
+            r1_label = "Posible incompatibilidad"
+            r1_ev = f"Régimen declarado: {cls.REGIME_LABELS.get(regime, regime)}."
+            r1_comp = (
+                "Posible incompatibilidad normativa: el expediente invoca un régimen sustituido/derogado "
+                "(Ley N.° 30225 o Ley N.° 26850), cuando desde el 22/04/2025 rige la Ley N.° 32069 y su Reglamento D.S. N.° 009-2025-EF. "
+                "Remitido a Asesoría Jurídica para verificar si existe régimen transitorio aplicable, sin certificar infracción automática."
+            )
+        elif regime in ("regimen_especial", "administracion_directa"):
+            r1_status = "requires_review"
+            r1_label = "Requiere revisión"
+            r1_ev = f"Régimen declarado: {cls.REGIME_LABELS.get(regime, regime)}."
+            r1_comp = "Régimen especial o administración directa requiere validación humana sobre exclusión del ámbito de la Ley N.° 32069."
+        elif not active_by_id.get("LEY32069-01"):
+            r1_status = "missing_data"
+            r1_label = "Falta sustento normativo"
+            r1_ev = f"Régimen declarado: {cls.REGIME_LABELS.get(regime, regime)}."
+            r1_comp = "Falta fragmento vigente de Ley N.° 32069 en normative_documents para emitir conclusión preliminar."
+        else:
+            r1_status = "compliant_preliminary"
+            r1_label = "Compatible preliminar"
+            r1_ev = f"Régimen declarado: {cls.REGIME_LABELS.get(regime, regime)}."
+            r1_comp = "El expediente declara acogerse al marco vigente de la Ley N.° 32069 (en vigor desde 22/04/2025)."
+
+        examined.append({
+            "requirement_code": "REGIMEN_VIGENTE",
+            "requirement_name": "Régimen contractual vigente (Ley N.° 32069)",
+            "status": r1_status,
+            "status_label": r1_label,
+            "expedient_evidence": r1_ev,
+            "comparison_detail": r1_comp,
+            **meta_r1,
+        })
+
+        # Requisito 2: Objeto, procedimiento de selección y tope de cuantía (Arts. 34, 53, 54 Ley 32069 + UIT 2026)
+        meta_r2 = _chunk_meta("LEY32069-03", "Arts. 34, 53 y 54 (concordado D.S. 301-2025-EF UIT 2026)")
+        raw_budget = project.get("estimated_budget_pen")
+        budget_pen = Decimal(str(raw_budget)) if raw_budget is not None else None
+        if not obj or not phase or not proc:
+            r2_status = "missing_data"
+            r2_label = "Falta dato"
+            r2_ev = f"Objeto: {obj or 'No indicado'} · Fase: {phase or 'No indicada'} · Procedimiento: {proc or 'No indicado'}."
+            r2_comp = "Faltan antecedentes contractuales (objeto, fase o procedimiento) para contrastar Arts. 34, 53 y 54; no se infiere de descripción."
+        elif proc == "contrato_menor" and budget_pen is not None and budget_pen > cls.MINOR_CONTRACT_MAX_PEN:
+            r2_status = "possible_incompatibility"
+            r2_label = "Posible incompatibilidad"
+            r2_ev = (
+                f"Procedimiento: Contrato menor (<= 8 UIT) · Objeto: {cls.OBJECT_LABELS.get(obj, obj)} · "
+                f"Presupuesto estimado: S/ {budget_pen:,.2f}."
+            )
+            r2_comp = (
+                f"Posible incompatibilidad con el Art. 34.1 de la Ley N.° 32069: se declara contrato menor pese a que "
+                f"el presupuesto estimado (S/ {budget_pen:,.2f}) supera el tope legal de 8 UIT vigentes para 2026 "
+                f"(S/ {cls.MINOR_CONTRACT_MAX_PEN:,.2f} según D.S. N.° 301-2025-EF). "
+                "Debe remitirse a Asesoría Jurídica y DEC para evaluar procedimiento competitivo, sin certificar infracción definitiva."
+            )
+        elif obj == "obra" and proc == "concurso_publico":
+            r2_status = "possible_incompatibility"
+            r2_label = "Posible incompatibilidad"
+            r2_ev = f"Objeto: Obra pública · Procedimiento declarado: Concurso público · Fase: {cls.PHASE_LABELS.get(phase, phase)}."
+            r2_comp = (
+                "Posible incompatibilidad con el Art. 54.1 de la Ley N.° 32069: la licitación pública corresponde a bienes y obras "
+                "(Art. 54.1.a), mientras el concurso público aplica a servicios (Art. 54.1.b). "
+                "Se remite a Asesoría Jurídica para revisión humana sin certificar infracción automática."
+            )
+        elif obj in ("servicio", "consultoria_obra") and proc == "licitacion_publica":
+            r2_status = "possible_incompatibility"
+            r2_label = "Posible incompatibilidad"
+            r2_ev = f"Objeto: {cls.OBJECT_LABELS.get(obj, obj)} · Procedimiento declarado: Licitación pública."
+            r2_comp = (
+                "Posible incompatibilidad con el Art. 54.1 de la Ley N.° 32069: el concurso público corresponde a servicios/consultorías "
+                "(Art. 54.1.b), mientras la licitación pública aplica a bienes y obras (Art. 54.1.a). Remitido a Asesoría Jurídica."
+            )
+        elif proc == "contratacion_no_competitiva":
+            r2_status = "requires_review"
+            r2_label = "Requiere revisión"
+            r2_ev = f"Procedimiento no competitivo declarado · Objeto: {cls.OBJECT_LABELS.get(obj, obj)}."
+            r2_comp = (
+                "Conforme al Art. 54.3 de la Ley N.° 32069 y Art. 46.1.b del Reglamento (D.S. N.° 009-2025-EF mod. D.S. 001-2026-EF), "
+                "todo procedimiento no competitivo exige validación jurídica expresa de causal legal habilitante."
+            )
+        elif not active_by_id.get("LEY32069-03"):
+            r2_status = "missing_data"
+            r2_label = "Falta sustento normativo"
+            r2_ev = f"Objeto: {cls.OBJECT_LABELS.get(obj, obj)} · Procedimiento: {cls.PROCEDURE_LABELS.get(proc, proc)}."
+            r2_comp = "Falta fragmento vigente LEY32069-03 para validar procedimiento."
+        else:
+            r2_status = "compliant_preliminary"
+            r2_label = "Compatible preliminar"
+            budget_txt = f"S/ {budget_pen:,.2f}" if budget_pen is not None else "No especificado"
+            r2_ev = (
+                f"Objeto: {cls.OBJECT_LABELS.get(obj, obj)} · Fase: {cls.PHASE_LABELS.get(phase, phase)} · "
+                f"Procedimiento: {cls.PROCEDURE_LABELS.get(proc, proc)} · Monto: {budget_txt}."
+            )
+            r2_comp = (
+                "Consistente preliminarmente con los Arts. 34, 53 y 54.1 de la Ley N.° 32069 "
+                "(sujeto a verificación de cuantía y bases por la DEC conforme al D.S. N.° 009-2025-EF mod. D.S. N.° 001-2026-EF)."
+            )
+
+        examined.append({
+            "requirement_code": "PROCEDIMIENTO_Y_CUANTIA",
+            "requirement_name": "Objeto, procedimiento de selección y límite 8 UIT (Arts. 34, 53 y 54)",
+            "status": r2_status,
+            "status_label": r2_label,
+            "expedient_evidence": r2_ev,
+            "comparison_detail": r2_comp,
+            **meta_r2,
+        })
+
+        # Requisito 3: Requerimiento, inclusión en CMN, viabilidad y certificación presupuestal
+        meta_r3 = _chunk_meta("DS009-2025-REG-54", "Ley Art. 46; Reg. D.S. 009-2025-EF Arts. 44, 46.1.c, 54.2 y 54.3")
+        if req_def is None or in_cmn is None or budget_cert is None or not doc_ref:
+            r3_status = "missing_data"
+            r3_label = "Falta dato"
+            r3_ev = (
+                f"Requerimiento definido: {req_def if req_def is not None else 'No informado'} · "
+                f"CMN/Viabilidad: {in_cmn if in_cmn is not None else 'No informado'} · "
+                f"Certificación presupuestal: {budget_cert if budget_cert is not None else 'No informado'} · "
+                f"Doc. ref.: {doc_ref or 'No informado'}."
+            )
+            r3_comp = "Faltan antecedentes sobre requerimiento, CMN/viabilidad Invierte.pe, certificación presupuestal o documento verificable."
+        elif req_def is False or in_cmn is False or budget_cert is False:
+            r3_status = "possible_incompatibility"
+            r3_label = "Posible incompatibilidad"
+            neg = []
+            if req_def is False:
+                neg.append("sin requerimiento técnico/funcional definido (Art. 46 / Reg. Art. 44)")
+            if in_cmn is False:
+                neg.append("sin registro en CMN aprobado o viabilidad Invierte.pe (Reg. Arts. 46.1.c y 54.3)")
+            if budget_cert is False:
+                neg.append("sin certificación o previsión presupuestal (Reg. Art. 54.2.f)")
+            r3_ev = f"Antecedente {doc_ref}: se declara incumplimiento preliminar en {', '.join(neg)}."
+            r3_comp = (
+                f"Posible incompatibilidad con actuaciones preparatorias obligatorias ({'; '.join(neg)}). "
+                "Remitido a Asesoría Jurídica para evaluación humana sin certificar infracción automática."
+            )
+        elif not active_by_id.get("DS009-2025-REG-54") or not active_by_id.get("LEY32069-02"):
+            r3_status = "missing_data"
+            r3_label = "Falta sustento normativo"
+            r3_ev = f"Documento contractual declarado: {doc_ref}."
+            r3_comp = "Faltan fragmentos vigentes de Art. 46 y Reglamento Arts. 44/54 para emitir conclusión preliminar."
+        else:
+            r3_status = "compliant_preliminary"
+            r3_label = "Compatible preliminar"
+            r3_ev = f"Doc. sustento: {doc_ref}. Requerimiento definido, previsto en CMN/Invierte.pe y con certificación presupuestal declarada."
+            r3_comp = (
+                "Alineado preliminarmente con Art. 46 de la Ley N.° 32069 y Arts. 44, 46.1.c y 54.2/54.3 del D.S. N.° 009-2025-EF "
+                "(mod. D.S. N.° 001-2026-EF), sujeto a cotejo del expediente de contratación aprobado."
+            )
+
+        examined.append({
+            "requirement_code": "REQUERIMIENTO_CMN_PRESUPUESTO",
+            "requirement_name": "Requerimiento, CMN/Invierte.pe y certificación presupuestal (Art. 46; Reg. Art. 54)",
+            "status": r3_status,
+            "status_label": r3_label,
+            "expedient_evidence": r3_ev,
+            "comparison_detail": r3_comp,
+            **meta_r3,
+        })
+
+        # Requisito 4: Trazabilidad en PLADICOP (Art. 41 mod. Ley 32187) y no fraccionamiento (Art. 50 / Reg. Art. 45)
+        meta_r4 = _chunk_meta("LEY32069-06", "Art. 41 (mod. Ley 32187) y Art. 50 / Reg. Art. 45")
+        if pladicop is None or no_frac is None:
+            r4_status = "missing_data"
+            r4_label = "Falta dato"
+            r4_ev = (
+                f"Registro en PLADICOP: {pladicop if pladicop is not None else 'No informado'} · "
+                f"Sin fraccionamiento: {no_frac if no_frac is not None else 'No informado'}."
+            )
+            r4_comp = "Falta declarar previsión de registro en PLADICOP (Art. 41 mod. Ley 32187) y verificación de no fraccionamiento (Art. 50)."
+        elif pladicop is False or no_frac is False:
+            r4_status = "possible_incompatibility"
+            r4_label = "Posible incompatibilidad"
+            issues = []
+            if pladicop is False:
+                issues.append("omisión de registro obligatorio en PLADICOP (Art. 41.2 mod. Ley N.° 32187)")
+            if no_frac is False:
+                issues.append("indicio o declaración de fraccionamiento prohibido (Art. 50.1 / Reg. Art. 45)")
+            r4_ev = f"Declaración contractual advierte: {', '.join(issues)}."
+            r4_comp = (
+                f"Posible incompatibilidad con reglas de transparencia y planificación ({'; '.join(issues)}). "
+                "Remitido a Asesoría Jurídica para validación humana sin certificar infracción automática."
+            )
+        elif not active_by_id.get("LEY32069-06") or not active_by_id.get("LEY32069-02"):
+            r4_status = "missing_data"
+            r4_label = "Falta sustento normativo"
+            r4_ev = "PLADICOP y no fraccionamiento declarados en expediente."
+            r4_comp = "Falta fragmento vigente Art. 41 (mod. Ley 32187) en repositorio."
+        else:
+            r4_status = "compliant_preliminary"
+            r4_label = "Compatible preliminar"
+            r4_ev = "Se declara registro previsto en PLADICOP y ausencia de fraccionamiento indebido."
+            r4_comp = (
+                "Compatible preliminarmente con Art. 41.1/41.2 (mod. por Ley N.° 32187, vig. 01/01/2025) y Art. 50.1 de la Ley N.° 32069 / "
+                "Art. 45 del Reglamento D.S. N.° 009-2025-EF."
+            )
+
+        examined.append({
+            "requirement_code": "PLADICOP_Y_NO_FRACCIONAMIENTO",
+            "requirement_name": "Trazabilidad PLADICOP (Art. 41 mod. Ley 32187) y no fraccionamiento (Art. 50)",
+            "status": r4_status,
+            "status_label": r4_label,
+            "expedient_evidence": r4_ev,
+            "comparison_detail": r4_comp,
+            **meta_r4,
+        })
+
+        # Consolidar resultado estricto CA-HU1.10-01 / CA-HU1.10-02 / CA-HU1.10-03
+        incompatibilities = [e for e in examined if e["status"] == "possible_incompatibility"]
+        manual_triggers = [e for e in examined if e["status"] == "requires_review"]
+
+        if incompatibilities:
+            first_inc = incompatibilities[0]
+            affected_req = f"{first_inc['requirement_name']} ({first_inc.get('article_or_section') or 'Ley 32069'})"
+            obs_text = " ".join(e["comparison_detail"] for e in incompatibilities)
+            return {
+                "status": "possible_incompatibility",
+                "status_label": "Posible incompatibilidad (Derivado a Asesoría Jurídica)",
+                "preliminary_compliant": False,
+                "requires_human_review": True,
+                "certified_infraction": False,
+                "sent_to_legal_advisor": True,
+                "advisory_review_status": "pending",
+                "summary": (
+                    f"Posible incompatibilidad contractual detectada en '{affected_req}'. "
+                    f"{obs_text} "
+                    "El sistema NO certifica infracción definitiva y remite la observación al Asesor Jurídico para validación humana (CA-HU1.10-02)."
+                ),
+                "affected_requirement": affected_req,
+                "observation_explanation": obs_text,
+                "missing_fields": missing_fields,
+                "examined_requirements": examined,
+                "normative_sources": active_sources,
+                "superseded_sources_excluded": excluded_sources,
+                "consulted_at": cls.CONSULTED_AT,
+                "evaluated_at": now,
+            }
+
+        if missing_fields or manual_triggers:
+            reasons_txt = "; ".join(missing_fields) if missing_fields else "; ".join(m["comparison_detail"] for m in manual_triggers)
+            return {
+                "status": "requires_review",
+                "status_label": "Requiere revisión",
+                "preliminary_compliant": None,  # Abstención estricta (CA-HU1.10-03)
+                "requires_human_review": True,
+                "certified_infraction": False,
+                "sent_to_legal_advisor": True,
+                "advisory_review_status": "pending",
+                "summary": (
+                    "Revisión contractual no concluyente (CA-HU1.10-03): "
+                    f"faltan antecedentes o requieren cotejo humano ({reasons_txt}). "
+                    "No se infiere cumplimiento desde el título o descripción general del proyecto y no se afirma cumplimiento ni incumplimiento definitivo."
+                ),
+                "affected_requirement": None,
+                "observation_explanation": None,
+                "missing_fields": missing_fields,
+                "examined_requirements": examined,
+                "normative_sources": active_sources,
+                "superseded_sources_excluded": excluded_sources,
+                "consulted_at": cls.CONSULTED_AT,
+                "evaluated_at": now,
+            }
+
+        # CA-HU1.10-01: Conclusión preliminar sustentada con norma, versión y fragmento verificable
+        return {
+            "status": "verified_preliminary",
+            "status_label": "Conclusión preliminar sustentada",
+            "preliminary_compliant": True,
+            "requires_human_review": True,  # Alcance estrictamente preliminar sujeto a revisión humana/DEC
+            "certified_infraction": False,
+            "sent_to_legal_advisor": False,
+            "advisory_review_status": "not_required",
+            "summary": (
+                "Conclusión preliminar sustentada (CA-HU1.10-01): los antecedentes contractuales declarados para esta versión "
+                "resultan preliminarmente compatibles con los 4 bloques examinados de la Ley N.° 32069 (v. 2026-07-19-OECE) y "
+                "su Reglamento D.S. N.° 009-2025-EF (v. 2026-10-26-OECE, mod. D.S. N.° 001-2026-EF). "
+                "Esta conclusión tiene carácter preliminar y está sujeta a validación documental por la DEC y Asesoría Jurídica."
+            ),
+            "affected_requirement": None,
+            "observation_explanation": None,
+            "missing_fields": [],
+            "examined_requirements": examined,
+            "normative_sources": active_sources,
+            "superseded_sources_excluded": excluded_sources,
+            "consulted_at": cls.CONSULTED_AT,
+            "evaluated_at": now,
+        }
+
 
 class PertDurationEngine:
     """Motor de cálculo y validación de estimación de duración de obra e incertidumbre (PERT) - HU1.9.
@@ -1954,14 +2471,51 @@ class PlatformService:
         dispatcher: TaskDispatcher | None = None,
         enable_demo_fallback: bool = False,
         auth_db_url: str | None = None,
+        enable_synthetic_zoning_rehearsal: bool = False,
     ) -> None:
         self.db_url = _dsn(db_url)
         self.dispatcher = dispatcher
         self.enable_demo_fallback = enable_demo_fallback
         self.auth_db_url = _dsn(auth_db_url) if auth_db_url else None
+        self.enable_synthetic_zoning_rehearsal = enable_synthetic_zoning_rehearsal
+
+    _EXPEDIENTE_SCHEMA_DRAFT_FIELDS: ClassVar[set[str]] = {
+        "title",
+    }
 
     @staticmethod
-    def _missing(data: PMV1ProjectCreate) -> list[str]:
+    def _missing_from_values(values: dict[str, Any]) -> list[str]:
+        required_order = (
+            "title",
+            "description",
+            "location",
+            "proposed_land_use",
+            "estimated_budget_pen",
+            "beneficiaries_count",
+        )
+        missing: list[str] = []
+        for name in required_order:
+            value = values.get(name)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(name)
+
+        budget = values.get("estimated_budget_pen")
+        if budget is not None and Decimal(str(budget)) <= 0:
+            missing.append("estimated_budget_pen (> 0)")
+
+        beneficiaries = values.get("beneficiaries_count")
+        if beneficiaries is not None and int(beneficiaries) <= 0:
+            missing.append("beneficiaries_count (> 0)")
+        return missing
+
+    @classmethod
+    def _ensure_complete_project(cls, values: dict[str, Any]) -> None:
+        missing = cls._missing_from_values(values)
+        if missing:
+            raise ExpedientePMV1IncompletoError(missing)
+
+    @classmethod
+    def _missing(cls, data: PMV1ProjectCreate) -> list[str]:
         values = {
             "title": data.title,
             "description": data.description,
@@ -1970,23 +2524,111 @@ class PlatformService:
             "estimated_budget_pen": data.estimated_budget_pen,
             "beneficiaries_count": data.beneficiaries_count,
         }
-        missing = [name for name, value in values.items() if value is None]
-        if data.estimated_budget_pen is not None and data.estimated_budget_pen <= 0:
-            missing.append("estimated_budget_pen (> 0)")
-        if data.beneficiaries_count is not None and data.beneficiaries_count <= 0:
-            missing.append("beneficiaries_count (> 0)")
-        return missing
+        return cls._missing_from_values(values)
 
-    def create_project(self, data: PMV1ProjectCreate, actor_id: UUID) -> dict[str, Any]:
+    @staticmethod
+    def _project_content_fingerprint(data: PMV1ProjectCreate) -> str:
+        payload = {
+            "code": (data.code or "").strip().upper(),
+            "title": (data.title or "").strip(),
+            "description": (data.description or "").strip(),
+            "location": (data.location or "").strip(),
+            "proposed_land_use": (data.proposed_land_use or "").strip(),
+            "latitude": float(data.latitude) if data.latitude is not None else None,
+            "longitude": float(data.longitude) if data.longitude is not None else None,
+            "estimated_budget_pen": (
+                str(Decimal(data.estimated_budget_pen).quantize(Decimal("0.01")))
+                if data.estimated_budget_pen is not None
+                else None
+            ),
+            "beneficiaries_count": int(data.beneficiaries_count) if data.beneficiaries_count is not None else None,
+            "save_as_draft": bool(data.save_as_draft),
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def create_project(
+        self,
+        data: PMV1ProjectCreate,
+        actor_id: UUID,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         missing = self._missing(data)
-        if missing:
+        if missing and not data.save_as_draft:
             raise ExpedientePMV1IncompletoError(missing)
+        if data.save_as_draft:
+            invalid_draft_fields = [
+                f
+                for f in missing
+                if f
+                in (
+                    "title",
+                    "estimated_budget_pen (> 0)",
+                    "beneficiaries_count (> 0)",
+                )
+            ]
+            if invalid_draft_fields:
+                raise ExpedientePMV1IncompletoError(invalid_draft_fields)
+
+        cleaned_idem = idempotency_key.strip() if idempotency_key and idempotency_key.strip() else None
+        fingerprint = self._project_content_fingerprint(data)
+        project_status = "draft" if missing else "ready"
+        audit_action = "PROJECT_DRAFT_CREATED" if missing else "PROJECT_CREATED"
         project_id, version_id = uuid4(), uuid4()
+
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
-                code = (data.code or "").strip() or _allocate_expediente_code(conn)
+                if cleaned_idem:
+                    prev = conn.execute(
+                        """
+                        SELECT id, code, content_fingerprint
+                        FROM projects
+                        WHERE creation_idempotency_key = %s
+                        """,
+                        (cleaned_idem,),
+                    ).fetchone()
+                    if prev:
+                        if prev.get("content_fingerprint") and prev["content_fingerprint"] != fingerprint:
+                            raise ConfiguracionPMV1Error(
+                                "Idempotency-Key ya fue utilizada para registrar un expediente distinto."
+                            )
+                        existing = self.get_project(prev["id"])
+                        existing["duplicated"] = True
+                        return existing
+
+                dup_fp = conn.execute(
+                    """
+                    SELECT id, code
+                    FROM projects
+                    WHERE content_fingerprint = %s
+                    LIMIT 1
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+                if dup_fp:
+                    raise ConfiguracionPMV1Error(
+                        f"Solicitud de carga duplicada: ya existe un expediente idéntico registrado "
+                        f"(código {dup_fp['code']}, id {dup_fp['id']}). No se generó ningún duplicado."
+                    )
+
+                explicit_code = (data.code or "").strip()
+                if explicit_code:
+                    dup_code = conn.execute(
+                        "SELECT id, code FROM projects WHERE code = %s LIMIT 1",
+                        (explicit_code,),
+                    ).fetchone()
+                    if dup_code:
+                        raise ConfiguracionPMV1Error(
+                            f"Ya existe un expediente registrado con el código '{explicit_code}' (id {dup_code['id']})."
+                        )
+
+                code = explicit_code or _allocate_expediente_code(conn)
                 conn.execute(
-                    "INSERT INTO projects (id, code, created_by_user_id, status) VALUES (%s,%s,%s,'ready')",
-                    (project_id, code, actor_id),
+                    """
+                    INSERT INTO projects
+                    (id, code, created_by_user_id, status, creation_idempotency_key, content_fingerprint)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    (project_id, code, actor_id, project_status, cleaned_idem, fingerprint),
                 )
                 conn.execute(
                     """
@@ -2001,7 +2643,7 @@ class PlatformService:
                         version_id,
                         project_id,
                         data.title,
-                        data.description,
+                        data.description or "",
                         data.location,
                         data.proposed_land_use,
                         data.latitude,
@@ -2016,13 +2658,216 @@ class PlatformService:
                 conn.execute(
                     """INSERT INTO audit_events
                     (actor_user_id, action, entity_type, entity_id, details)
-                    VALUES (%s,'PROJECT_CREATED','project',%s,%s)""",
+                    VALUES (%s,%s,'project',%s,%s)""",
                     (
                         actor_id,
+                        audit_action,
                         project_id,
-                        Jsonb({"project_version_id": str(version_id)}),
+                        Jsonb(
+                            {
+                                "project_version_id": str(version_id),
+                                "status": project_status,
+                                "missing_fields": missing,
+                                "content_fingerprint": fingerprint,
+                            }
+                        ),
                     ),
                 )
+        created = self.get_project(project_id)
+        created["duplicated"] = False
+        return created
+
+    def update_project(
+        self, project_id: UUID, data: PMV1ProjectUpdate, actor_id: UUID
+    ) -> dict[str, Any]:
+        """Completa o corrige un expediente en borrador o crea una nueva versión corregida (HU1.2)."""
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            p_row = conn.execute(
+                "SELECT id, status FROM projects WHERE id = %s FOR UPDATE",
+                (project_id,),
+            ).fetchone()
+            if not p_row:
+                raise RecursoPMV1NoEncontradoError("Proyecto no encontrado")
+
+            latest_pv = conn.execute(
+                """
+                SELECT id, version_number, title, description,
+                       location_description AS location, proposed_land_use,
+                       territorial_data_origin, latitude, longitude,
+                       coordinates_origin, coordinates_source,
+                       estimated_budget_pen, beneficiaries_count
+                FROM project_versions
+                WHERE project_id = %s
+                ORDER BY version_number DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (project_id,),
+            ).fetchone()
+            if not latest_pv:
+                raise RecursoPMV1NoEncontradoError("Versión de proyecto no encontrada")
+
+            fields_set = data.model_fields_set
+            merged = {
+                "title": data.title if "title" in fields_set else latest_pv["title"],
+                "description": (
+                    (data.description or "")
+                    if "description" in fields_set
+                    else (latest_pv["description"] or "")
+                ),
+                "location": data.location if "location" in fields_set else latest_pv["location"],
+                "proposed_land_use": (
+                    data.proposed_land_use
+                    if "proposed_land_use" in fields_set
+                    else latest_pv["proposed_land_use"]
+                ),
+                "estimated_budget_pen": (
+                    data.estimated_budget_pen
+                    if "estimated_budget_pen" in fields_set
+                    else latest_pv["estimated_budget_pen"]
+                ),
+                "beneficiaries_count": (
+                    data.beneficiaries_count
+                    if "beneficiaries_count" in fields_set
+                    else latest_pv["beneficiaries_count"]
+                ),
+                "latitude": data.latitude if "latitude" in fields_set else latest_pv["latitude"],
+                "longitude": data.longitude if "longitude" in fields_set else latest_pv["longitude"],
+                "coordinates_origin": (
+                    data.coordinates_origin
+                    if "coordinates_origin" in fields_set
+                    else latest_pv["coordinates_origin"]
+                ),
+                "coordinates_source": (
+                    data.coordinates_source
+                    if "coordinates_source" in fields_set
+                    else latest_pv["coordinates_source"]
+                ),
+            }
+
+            missing = self._missing_from_values(merged)
+            if missing and not data.save_as_draft:
+                raise ExpedientePMV1IncompletoError(missing)
+            if data.save_as_draft:
+                invalid_draft_fields = [
+                    f
+                    for f in missing
+                    if f
+                    in (
+                        "title",
+                        "estimated_budget_pen (> 0)",
+                        "beneficiaries_count (> 0)",
+                    )
+                ]
+                if invalid_draft_fields:
+                    raise ExpedientePMV1IncompletoError(invalid_draft_fields)
+
+            if not data.create_new_version and p_row["status"] not in ("draft", "ready"):
+                raise ConfiguracionPMV1Error(
+                    "El expediente ya inició evaluación o cuenta con revisión registrada; registre una nueva versión para modificarlo."
+                )
+
+            new_status = "draft" if missing else "ready"
+            now = datetime.now(timezone.utc)
+            lat = merged["latitude"]
+            lon = merged["longitude"]
+            coord_origin = merged["coordinates_origin"] if lat is not None else None
+            coord_source = merged["coordinates_source"] if lat is not None else None
+
+            if data.create_new_version:
+                next_version = int(latest_pv["version_number"]) + 1
+                target_version_id = uuid4()
+                conn.execute(
+                    """
+                    INSERT INTO project_versions
+                    (id, project_id, version_number, title, description,
+                     location_description, proposed_land_use, territorial_data_origin,
+                     latitude, longitude, coordinates_origin, coordinates_source,
+                     estimated_budget_pen, beneficiaries_count, created_by_user_id, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        target_version_id,
+                        project_id,
+                        next_version,
+                        merged["title"],
+                        merged["description"],
+                        merged["location"],
+                        merged["proposed_land_use"],
+                        latest_pv["territorial_data_origin"] or "declared",
+                        lat,
+                        lon,
+                        coord_origin,
+                        coord_source,
+                        merged["estimated_budget_pen"],
+                        merged["beneficiaries_count"],
+                        actor_id,
+                        now,
+                    ),
+                )
+                audit_action = "PROJECT_VERSION_CREATED"
+            else:
+                target_version_id = latest_pv["id"]
+                next_version = int(latest_pv["version_number"])
+                conn.execute(
+                    """
+                    UPDATE project_versions
+                    SET title = %s,
+                        description = %s,
+                        location_description = %s,
+                        proposed_land_use = %s,
+                        latitude = %s,
+                        longitude = %s,
+                        coordinates_origin = %s,
+                        coordinates_source = %s,
+                        estimated_budget_pen = %s,
+                        beneficiaries_count = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        merged["title"],
+                        merged["description"],
+                        merged["location"],
+                        merged["proposed_land_use"],
+                        lat,
+                        lon,
+                        coord_origin,
+                        coord_source,
+                        merged["estimated_budget_pen"],
+                        merged["beneficiaries_count"],
+                        target_version_id,
+                    ),
+                )
+                audit_action = (
+                    "PROJECT_DRAFT_COMPLETED"
+                    if p_row["status"] == "draft" and new_status == "ready"
+                    else "PROJECT_UPDATED"
+                )
+
+            conn.execute(
+                "UPDATE projects SET status = %s, updated_at = %s WHERE id = %s",
+                (new_status, now, project_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_events (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, %s, 'project', %s, %s)
+                """,
+                (
+                    actor_id,
+                    audit_action,
+                    project_id,
+                    Jsonb(
+                        {
+                            "project_version_id": str(target_version_id),
+                            "version_number": next_version,
+                            "previous_status": p_row["status"],
+                            "new_status": new_status,
+                            "missing_fields": missing,
+                        }
+                    ),
+                ),
+            )
         return self.get_project(project_id)
 
     def create_project_version(
@@ -2231,7 +3076,109 @@ class PlatformService:
             res["checkpoint"] = checkpoint
             res["pert_estimate"] = pert_estimate
             res["technical_assessment"] = self._get_technical_assessment_with_conn(conn, row["project_version_id"])
+            res["economic_evaluation"] = self._get_latest_evaluation_for_version_with_conn(
+                conn,
+                row["project_version_id"],
+                checkpoint=checkpoint,
+            )
+            res["zoning_precheck"] = self._get_latest_zoning_precheck_with_conn(
+                conn, res
+            )
+            dispatches = self._get_dimension_dispatches_with_conn(conn, row["project_version_id"])
+            res["dimension_dispatches"] = dispatches
+            res["has_failed_dimensions"] = any(d["status"] == "failed" for d in dispatches)
+            res["duplicated"] = False
+            if res["has_failed_dimensions"] and res["status"] == "evaluated":
+                res["status"] = "evaluating"
             return res
+
+    _DIMENSION_NAMES: ClassVar[dict[str, str]] = {
+        "economic": "Económica",
+        "social": "Social",
+        "environmental": "Ambiental",
+        "technical": "Técnica",
+        "legal": "Jurídica",
+    }
+    _DIMENSION_ORDER: ClassVar[tuple[str, ...]] = (
+        "economic",
+        "social",
+        "environmental",
+        "technical",
+        "legal",
+    )
+
+    @classmethod
+    def _get_dimension_dispatches_with_conn(
+        cls, conn: psycopg.Connection[Any], project_version_id: UUID
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT dimension_code, project_version_id, status, status_label,
+                   result_reference_id, summary, error_message, attempt_count,
+                   dispatched_at, updated_at
+            FROM evaluation_dimension_dispatches
+            WHERE project_version_id = %s
+            """,
+            (project_version_id,),
+        ).fetchall()
+        by_code = {r["dimension_code"]: dict(r) for r in rows}
+        ordered: list[dict[str, Any]] = []
+        for code in cls._DIMENSION_ORDER:
+            if code in by_code:
+                item = by_code[code]
+                item["dimension_name"] = cls._DIMENSION_NAMES[code]
+                ordered.append(item)
+        return ordered
+
+    @staticmethod
+    def _upsert_dimension_dispatch_with_conn(
+        conn: psycopg.Connection[Any],
+        *,
+        evaluation_id: UUID,
+        project_id: UUID,
+        project_version_id: UUID,
+        dimension_code: str,
+        status: str,
+        status_label: str,
+        result_reference_id: UUID | None = None,
+        summary: str | None = None,
+        error_message: str | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO evaluation_dimension_dispatches (
+                id, evaluation_id, project_id, project_version_id, dimension_code,
+                status, status_label, result_reference_id, summary, error_message,
+                attempt_count, dispatched_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now(), now())
+            ON CONFLICT (project_version_id, dimension_code) DO UPDATE SET
+                evaluation_id = EXCLUDED.evaluation_id,
+                status = EXCLUDED.status,
+                status_label = EXCLUDED.status_label,
+                result_reference_id = COALESCE(EXCLUDED.result_reference_id, evaluation_dimension_dispatches.result_reference_id),
+                summary = COALESCE(EXCLUDED.summary, evaluation_dimension_dispatches.summary),
+                error_message = EXCLUDED.error_message,
+                attempt_count = CASE
+                    WHEN %s THEN evaluation_dimension_dispatches.attempt_count + 1
+                    ELSE evaluation_dimension_dispatches.attempt_count
+                END,
+                updated_at = now()
+            """,
+            (
+                uuid4(),
+                evaluation_id,
+                project_id,
+                project_version_id,
+                dimension_code,
+                status,
+                status_label,
+                result_reference_id,
+                summary,
+                error_message,
+                increment_attempt,
+            ),
+        )
 
 
     def _get_pert_estimate_with_conn(
@@ -2315,6 +3262,7 @@ class PlatformService:
     ) -> dict[str, Any]:
         """Ejecuta y persiste la preevaluación de viabilidad técnica del expediente para su versión vigente (HU1.8)."""
         project = self.get_project(project_id)
+        self._ensure_complete_project(project)
         project_version_id = project["project_version_id"]
         version_number = project["version_number"]
         cleaned_key = (idempotency_key or "").strip() or None
@@ -3207,7 +4155,7 @@ class PlatformService:
                 FROM checkpoint_review_decisions d
                 JOIN evaluation_checkpoints c ON c.id = d.checkpoint_id
                 WHERE d.project_id = %s AND d.project_version_id = %s
-                ORDER BY d.decided_at DESC, d.created_at DESC
+                ORDER BY d.decided_at DESC, d.created_at DESC, d.id DESC
                 """,
                 (project_id, version_id),
             ).fetchall()
@@ -3515,8 +4463,18 @@ class PlatformService:
                     "actor_name": actor_names.get(v["created_by_user_id"]),
                     "result": f"Versión v{vnum}",
                     "detail": (
-                        f"{v['title']} · Presupuesto: S/ {float(v['estimated_budget_pen']):,.2f} · "
-                        f"Beneficiarios est.: {v['beneficiaries_count']:,}"
+                        f"{v['title']} · Presupuesto: "
+                        + (
+                            f"S/ {float(v['estimated_budget_pen']):,.2f}"
+                            if v.get("estimated_budget_pen") is not None
+                            else "Pendiente"
+                        )
+                        + " · Beneficiarios est.: "
+                        + (
+                            f"{int(v['beneficiaries_count']):,}"
+                            if v.get("beneficiaries_count") is not None
+                            else "Pendiente"
+                        )
                     ),
                 },
             )
@@ -3967,7 +4925,11 @@ class PlatformService:
                 "version_number": int(v["version_number"]),
                 "title": v["title"],
                 "estimated_budget_pen": v["estimated_budget_pen"],
-                "beneficiaries_count": int(v["beneficiaries_count"]),
+                "beneficiaries_count": (
+                    int(v["beneficiaries_count"])
+                    if v.get("beneficiaries_count") is not None
+                    else None
+                ),
                 "created_by_user_id": v["created_by_user_id"],
                 "created_by_name": actor_names.get(v["created_by_user_id"]),
                 "created_at": v["created_at"],
@@ -4155,35 +5117,742 @@ class PlatformService:
             )
         return self.get_project(row["id"])
 
-    def validate_project(self, project_id: UUID) -> dict[str, Any]:
-        project = self.get_project(project_id)
-        missing = [
-            field
-            for field in (
-                "title",
-                "description",
-                "location",
-                "proposed_land_use",
-                "estimated_budget_pen",
-                "beneficiaries_count",
-            )
-            if project.get(field) in (None, "")
-        ]
+    def validate_project(
+        self, project_id: UUID, version_id: UUID | None = None
+    ) -> dict[str, Any]:
+        if version_id is None:
+            project = self.get_project(project_id)
+            target_version_id = project["project_version_id"]
+            target_version_number = project["version_number"]
+            values = project
+        else:
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+                pv_row = conn.execute(
+                    """
+                    SELECT id AS project_version_id, project_id, version_number,
+                           title, description, location_description AS location,
+                           proposed_land_use, estimated_budget_pen, beneficiaries_count
+                    FROM project_versions
+                    WHERE id = %s
+                    """,
+                    (version_id,),
+                ).fetchone()
+            if not pv_row:
+                raise RecursoPMV1NoEncontradoError("Versión del expediente no encontrada")
+            if pv_row["project_id"] != project_id:
+                raise VersionNoPertenecienteError(
+                    "La versión indicada no pertenece al expediente consultado.",
+                    project_id=str(project_id),
+                    version_id=str(version_id),
+                )
+            target_version_id = pv_row["project_version_id"]
+            target_version_number = pv_row["version_number"]
+            values = dict(pv_row)
+
+        missing = self._missing_from_values(values)
+        missing_labels = ExpedientePMV1IncompletoError.format_labels(missing)
         complete = not missing
         return {
             "complete": complete,
             "status": "ready" if complete else "incomplete",
             "missing_fields": missing,
-            "message": "Expediente completo"
-            if complete
-            else "Complete los datos antes de evaluar",
+            "missing_field_labels": missing_labels,
+            "project_version_id": target_version_id,
+            "version_number": target_version_number,
+            "message": (
+                "Expediente completo"
+                if complete
+                else f"Complete los datos obligatorios antes de evaluar: {', '.join(missing_labels)}."
+            ),
         }
+
+    def _execute_specialist_dimension(
+        self,
+        *,
+        dimension_code: str,
+        evaluation_id: UUID,
+        project_id: UUID,
+        project_code: str,
+        project_version_id: UUID,
+        version_number: int,
+        actor_id: UUID,
+    ) -> dict[str, Any]:
+        """Ejecuta de forma aislada y trazable un especialista (social, ambiental, técnico o jurídico) para project_version_id."""
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            if dimension_code == "social":
+                rows = conn.execute(
+                    """
+                    SELECT id, project_id, project_code, category, indicator_name,
+                           metric_value, metric_unit, has_sufficient_data, source_name,
+                           data_origin, description,
+                           (data_origin = 'simulated') AS is_simulated
+                    FROM territorial_social_indicators
+                    WHERE project_id = %s OR project_code = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (project_id, project_code),
+                ).fetchall()
+                equity_rows = conn.execute(
+                    """
+                    SELECT id, project_id, project_code, dimension, has_sufficient_data,
+                           target_group, aggregated_population, aggregated_percentage,
+                           equity_criterion, declared_benefit, verifiable_data,
+                           has_favorable_evidence, score_effect_pts, effect_type,
+                           effect_explanation, source_name, data_origin, description,
+                           (data_origin = 'simulated') AS is_simulated
+                    FROM project_demographic_equity_records
+                    WHERE project_id = %s OR project_code = %s
+                    ORDER BY dimension ASC
+                    """,
+                    (project_id, project_code),
+                ).fetchall()
+                assessment = SocialAccessibilityEngine.evaluate(
+                    project_id=project_id,
+                    project_code=project_code,
+                    project_version_id=project_version_id,
+                    indicator_rows=[dict(r) for r in rows],
+                    equity_rows=[dict(r) for r in equity_rows],
+                )
+                idem = f"coord-{evaluation_id}-social-{project_version_id}"
+                existing_soc = conn.execute(
+                    """
+                    SELECT id FROM social_accessibility_assessments
+                    WHERE project_version_id = %s
+                    ORDER BY evaluated_at DESC LIMIT 1
+                    """,
+                    (project_version_id,),
+                ).fetchone()
+                if existing_soc:
+                    assessment_id = existing_soc["id"]
+                    conn.execute(
+                        """
+                        UPDATE social_accessibility_assessments
+                        SET status = %s, summary = %s, results_json = %s,
+                            equity_json = %s, social_score = %s,
+                            score_explanation = %s, evaluated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            assessment["status"],
+                            assessment["summary"],
+                            Jsonb({"categories": assessment["categories"], "equity": assessment.get("equity")}),
+                            Jsonb(assessment["equity"]) if assessment.get("equity") else None,
+                            assessment.get("social_score"),
+                            assessment.get("score_explanation"),
+                            assessment["evaluated_at"],
+                            assessment_id,
+                        ),
+                    )
+                else:
+                    assessment_id = uuid4()
+                    conn.execute(
+                        """
+                        INSERT INTO social_accessibility_assessments
+                        (id, project_id, project_version_id, requested_by_user_id, idempotency_key,
+                         status, summary, results_json, equity_json, social_score, score_explanation, evaluated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            assessment_id,
+                            project_id,
+                            project_version_id,
+                            actor_id,
+                            idem,
+                            assessment["status"],
+                            assessment["summary"],
+                            Jsonb({"categories": assessment["categories"], "equity": assessment.get("equity")}),
+                            Jsonb(assessment["equity"]) if assessment.get("equity") else None,
+                            assessment.get("social_score"),
+                            assessment.get("score_explanation"),
+                            assessment["evaluated_at"],
+                        ),
+                    )
+                raw_st = str(assessment.get("status") or "").lower()
+                if raw_st in ("complete", "completed", "verified", "evaluated") and assessment.get("social_score") is not None:
+                    d_status, d_label = "completed", "Completado"
+                else:
+                    d_status, d_label = "insufficient_data", "Información insuficiente"
+                return {"status": d_status, "status_label": d_label, "result_reference_id": assessment_id, "summary": assessment["summary"]}
+
+            if dimension_code == "environmental":
+                rows = conn.execute(
+                    """
+                    SELECT id, project_id, project_version_id, project_code, has_sufficient_data,
+                           environmental_component, declared_impacts, declared_measures,
+                           verifiable_evidence, proximity_to_water_meters,
+                           is_in_protected_or_risk_area, source_name, data_origin, description
+                    FROM project_environmental_records
+                    WHERE project_version_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (project_version_id,),
+                ).fetchall()
+                if not rows and version_number == 1:
+                    rows = conn.execute(
+                        """
+                        SELECT id, project_id, project_version_id, project_code, has_sufficient_data,
+                               environmental_component, declared_impacts, declared_measures,
+                               verifiable_evidence, proximity_to_water_meters,
+                               is_in_protected_or_risk_area, source_name, data_origin, description
+                        FROM project_environmental_records
+                        WHERE (project_id = %s OR project_code = %s) AND project_version_id IS NULL
+                        ORDER BY created_at ASC
+                        """,
+                        (project_id, project_code),
+                    ).fetchall()
+                green_rows = conn.execute(
+                    """
+                    SELECT id, project_id, project_version_id, project_code, has_sufficient_data,
+                           total_project_area_m2, green_area_m2, green_area_percentage,
+                           delimitation_description, declared_affectation, verifiable_affectation,
+                           affectation_type, protection_measures, has_sufficient_measures,
+                           score_effect_pts, effect_type, calculation_explanation,
+                           source_name, data_origin, description,
+                           (data_origin = 'simulated') AS is_simulated
+                    FROM project_green_area_records
+                    WHERE project_version_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (project_version_id,),
+                ).fetchall()
+                if not green_rows and version_number == 1:
+                    green_rows = conn.execute(
+                        """
+                        SELECT id, project_id, project_version_id, project_code, has_sufficient_data,
+                               total_project_area_m2, green_area_m2, green_area_percentage,
+                               delimitation_description, declared_affectation, verifiable_affectation,
+                               affectation_type, protection_measures, has_sufficient_measures,
+                               score_effect_pts, effect_type, calculation_explanation,
+                               source_name, data_origin, description,
+                               (data_origin = 'simulated') AS is_simulated
+                        FROM project_green_area_records
+                        WHERE (project_id = %s OR project_code = %s) AND project_version_id IS NULL
+                        ORDER BY created_at ASC
+                        """,
+                        (project_id, project_code),
+                    ).fetchall()
+                assessment = EnvironmentalAssessmentEngine.evaluate(
+                    project_id=project_id,
+                    project_code=project_code,
+                    project_version_id=project_version_id,
+                    records=[dict(r) for r in rows],
+                    green_records=[dict(g) for g in green_rows],
+                )
+                idem = f"coord-{evaluation_id}-env-{project_version_id}"
+                existing_env = conn.execute(
+                    """
+                    SELECT id FROM environmental_assessments
+                    WHERE project_version_id = %s
+                    ORDER BY evaluated_at DESC LIMIT 1
+                    """,
+                    (project_version_id,),
+                ).fetchone()
+                if existing_env:
+                    assessment_id = existing_env["id"]
+                    conn.execute(
+                        """
+                        UPDATE environmental_assessments
+                        SET status = %s, risk_level = %s, risk_observation = %s,
+                            requires_human_review = %s, favorable = %s, summary = %s,
+                            declared_vs_evidence_json = %s, impacts_json = %s,
+                            mitigations_json = %s, green_area_json = %s,
+                            environmental_score = %s, score_explanation = %s, evaluated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            assessment["status"],
+                            assessment["risk_level"],
+                            assessment["risk_observation"],
+                            assessment["requires_human_review"],
+                            assessment["favorable"],
+                            assessment["summary"],
+                            Jsonb(assessment["declared_vs_evidence"]),
+                            Jsonb(assessment["impacts"]),
+                            Jsonb(assessment["mitigations"]),
+                            Jsonb(assessment["green_area"]) if assessment.get("green_area") else None,
+                            assessment.get("environmental_score"),
+                            assessment.get("score_explanation"),
+                            assessment["evaluated_at"],
+                            assessment_id,
+                        ),
+                    )
+                else:
+                    assessment_id = uuid4()
+                    conn.execute(
+                        """
+                        INSERT INTO environmental_assessments
+                        (id, project_id, project_version_id, assessed_by_user_id, idempotency_key,
+                         status, risk_level, risk_observation, requires_human_review, favorable,
+                         summary, declared_vs_evidence_json, impacts_json, mitigations_json,
+                         green_area_json, environmental_score, score_explanation, evaluated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            assessment_id,
+                            project_id,
+                            project_version_id,
+                            actor_id,
+                            idem,
+                            assessment["status"],
+                            assessment["risk_level"],
+                            assessment["risk_observation"],
+                            assessment["requires_human_review"],
+                            assessment["favorable"],
+                            assessment["summary"],
+                            Jsonb(assessment["declared_vs_evidence"]),
+                            Jsonb(assessment["impacts"]),
+                            Jsonb(assessment["mitigations"]),
+                            Jsonb(assessment["green_area"]) if assessment.get("green_area") else None,
+                            assessment.get("environmental_score"),
+                            assessment.get("score_explanation"),
+                            assessment["evaluated_at"],
+                        ),
+                    )
+                risk = str(assessment.get("risk_level") or "").lower()
+                if risk == "high" and assessment.get("requires_human_review"):
+                    risk_info = RiskCheckpointEngine.detect_high_risk_condition(conn, project_version_id)
+                    if risk_info:
+                        RiskCheckpointEngine.create_or_get_checkpoint(
+                            conn,
+                            project_id=project_id,
+                            project_version_id=project_version_id,
+                            evaluation_id=evaluation_id,
+                            risk_info=risk_info,
+                        )
+                    return {
+                        "status": "pending_review",
+                        "status_label": "Pendiente de revisión (HITL)",
+                        "result_reference_id": assessment_id,
+                        "summary": assessment.get("risk_observation") or assessment["summary"],
+                    }
+                if risk == "insufficient" or assessment.get("status") == "insufficient" or assessment.get("environmental_score") is None:
+                    return {
+                        "status": "insufficient_data",
+                        "status_label": "Información insuficiente",
+                        "result_reference_id": assessment_id,
+                        "summary": assessment.get("risk_observation") or assessment["summary"],
+                    }
+                return {
+                    "status": "completed",
+                    "status_label": "Completado",
+                    "result_reference_id": assessment_id,
+                    "summary": assessment["summary"],
+                }
+
+            if dimension_code == "technical":
+                param_rows = conn.execute(
+                    """
+                    SELECT id, project_id, project_version_id, criterion_code, criterion_name,
+                           normative_reference, normative_version, has_sufficient_data,
+                           parameter_name, parameter_value_numeric, parameter_unit, parameter_value_text,
+                           applied_rule, supporting_document, source_origin, is_simulated
+                    FROM project_technical_parameters
+                    WHERE project_version_id = %s
+                    ORDER BY criterion_code ASC
+                    """,
+                    (project_version_id,),
+                ).fetchall()
+                assessment = TechnicalFeasibilityEngine.evaluate(
+                    project_id=project_id,
+                    project_code=project_code,
+                    project_version_id=project_version_id,
+                    version_number=version_number,
+                    parameter_rows=[dict(r) for r in param_rows],
+                )
+                assessment_id = uuid4()
+                idem = f"coord-{evaluation_id}-tech-{project_version_id}"
+                saved_row = conn.execute(
+                    """
+                    INSERT INTO technical_feasibility_assessments
+                    (id, project_id, project_version_id, requested_by_user_id, idempotency_key,
+                     status, overall_result, overall_result_label, is_viable, is_preliminary_opinion,
+                     disclaimer, summary, criteria_summary, findings_json, technical_score,
+                     score_explanation, dimension_conclusion, dimension_justification, evaluated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_version_id) DO UPDATE SET
+                        requested_by_user_id = EXCLUDED.requested_by_user_id,
+                        status = EXCLUDED.status,
+                        overall_result = EXCLUDED.overall_result,
+                        overall_result_label = EXCLUDED.overall_result_label,
+                        is_viable = EXCLUDED.is_viable,
+                        is_preliminary_opinion = EXCLUDED.is_preliminary_opinion,
+                        disclaimer = EXCLUDED.disclaimer,
+                        summary = EXCLUDED.summary,
+                        criteria_summary = EXCLUDED.criteria_summary,
+                        findings_json = EXCLUDED.findings_json,
+                        technical_score = EXCLUDED.technical_score,
+                        score_explanation = EXCLUDED.score_explanation,
+                        dimension_conclusion = EXCLUDED.dimension_conclusion,
+                        dimension_justification = EXCLUDED.dimension_justification,
+                        evaluated_at = EXCLUDED.evaluated_at
+                    RETURNING id
+                    """,
+                    (
+                        assessment_id,
+                        project_id,
+                        project_version_id,
+                        actor_id,
+                        idem,
+                        assessment["status"],
+                        assessment["overall_result"],
+                        assessment["overall_result_label"],
+                        assessment["is_viable"],
+                        assessment["is_preliminary_opinion"],
+                        assessment["disclaimer"],
+                        assessment["summary"],
+                        Jsonb(assessment["criteria_summary"]),
+                        Jsonb(assessment["criteria"]),
+                        Decimal(str(assessment["technical_score"])) if assessment["technical_score"] is not None else None,
+                        assessment["score_explanation"],
+                        assessment["dimension_conclusion"],
+                        assessment["dimension_justification"],
+                        assessment["evaluated_at"],
+                    ),
+                ).fetchone()
+                actual_id = saved_row["id"] if saved_row else assessment_id
+                ov = str(assessment.get("overall_result") or "").lower()
+                if ov == "informacion_insuficiente" or assessment.get("technical_score") is None:
+                    return {
+                        "status": "insufficient_data",
+                        "status_label": "Información insuficiente",
+                        "result_reference_id": actual_id,
+                        "summary": assessment["dimension_conclusion"],
+                    }
+                if ov in ("observado", "pendiente_revision"):
+                    return {
+                        "status": "requires_review",
+                        "status_label": assessment.get("overall_result_label") or "Requiere revisión",
+                        "result_reference_id": actual_id,
+                        "summary": assessment["dimension_conclusion"],
+                    }
+                return {
+                    "status": "completed",
+                    "status_label": "Completado",
+                    "result_reference_id": actual_id,
+                    "summary": assessment["dimension_conclusion"],
+                }
+
+            if dimension_code == "legal":
+                assessment, resolution_row = self._compute_legal_assessment_with_conn(
+                    conn, project_id, {"code": project_code}, project_version_id
+                )
+                assessment_id = UUID(assessment["assessment_id"])
+                saved_row = conn.execute(
+                    """
+                    INSERT INTO legal_assessments
+                    (id, project_id, project_code, project_version_id, status, summary, findings_json,
+                     total_findings, verifiable_citations_count, unverifiable_citations_count,
+                     requires_human_review, has_legal_alert, legal_alert_motive, legal_alert_norm,
+                     is_resolved, resolved_by_user_id, resolved_at, resolution_justification, evaluated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, project_version_id) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        summary = EXCLUDED.summary,
+                        findings_json = EXCLUDED.findings_json,
+                        total_findings = EXCLUDED.total_findings,
+                        verifiable_citations_count = EXCLUDED.verifiable_citations_count,
+                        unverifiable_citations_count = EXCLUDED.unverifiable_citations_count,
+                        requires_human_review = EXCLUDED.requires_human_review,
+                        has_legal_alert = EXCLUDED.has_legal_alert,
+                        legal_alert_motive = EXCLUDED.legal_alert_motive,
+                        legal_alert_norm = EXCLUDED.legal_alert_norm,
+                        is_resolved = EXCLUDED.is_resolved,
+                        resolved_by_user_id = EXCLUDED.resolved_by_user_id,
+                        resolved_at = EXCLUDED.resolved_at,
+                        resolution_justification = EXCLUDED.resolution_justification,
+                        evaluated_at = EXCLUDED.evaluated_at
+                    RETURNING id
+                    """,
+                    (
+                        assessment_id,
+                        project_id,
+                        project_code,
+                        project_version_id,
+                        assessment["status"],
+                        assessment["summary"],
+                        Jsonb(assessment["findings"]),
+                        assessment["total_findings"],
+                        assessment["verifiable_citations_count"],
+                        assessment["unverifiable_citations_count"],
+                        assessment["requires_human_review"],
+                        assessment["has_legal_alert"],
+                        assessment.get("legal_alert_motive"),
+                        assessment.get("legal_alert_norm"),
+                        assessment.get("is_resolved", False),
+                        resolution_row["resolved_by_user_id"] if resolution_row else None,
+                        resolution_row["resolved_at"] if resolution_row else None,
+                        assessment.get("resolution_justification"),
+                        assessment["evaluated_at"],
+                    ),
+                ).fetchone()
+                actual_id = saved_row["id"] if saved_row else assessment_id
+                st = str(assessment.get("status") or "").lower()
+                if st == "insufficient":
+                    return {
+                        "status": "insufficient_data",
+                        "status_label": "Información insuficiente",
+                        "result_reference_id": actual_id,
+                        "summary": assessment["summary"],
+                    }
+                if st == "verified":
+                    return {
+                        "status": "completed",
+                        "status_label": "Completado",
+                        "result_reference_id": actual_id,
+                        "summary": assessment["summary"],
+                    }
+                return {
+                    "status": "requires_review",
+                    "status_label": assessment.get("status_label") or "Requiere revisión",
+                    "result_reference_id": actual_id,
+                    "summary": assessment["summary"],
+                }
+
+        raise ConfiguracionPMV1Error(f"Especialista desconocido: {dimension_code}")
+
+    def _reconcile_evaluation_state_with_conn(
+        self,
+        conn: psycopg.Connection[Any],
+        *,
+        project_id: UUID,
+        project_version_id: UUID,
+        evaluation_id: UUID,
+    ) -> dict[str, Any]:
+        dispatches = self._get_dimension_dispatches_with_conn(conn, project_version_id)
+        has_failed = any(d["status"] == "failed" for d in dispatches)
+        has_checkpoint = RiskCheckpointEngine.has_pending_checkpoint(conn, project_version_id)
+        econ_row = conn.execute(
+            "SELECT status FROM evaluations WHERE id = %s",
+            (evaluation_id,),
+        ).fetchone()
+        econ_status = econ_row["status"] if econ_row else "queued"
+
+        if has_checkpoint or econ_status == "pending_review":
+            conn.execute(
+                "UPDATE projects SET status = 'pending_review', updated_at = now() WHERE id = %s",
+                (project_id,),
+            )
+        elif has_failed:
+            conn.execute(
+                "UPDATE projects SET status = 'evaluating', updated_at = now() WHERE id = %s",
+                (project_id,),
+            )
+        elif econ_status == "completed" and not has_failed:
+            conn.execute(
+                "UPDATE projects SET status = 'evaluated', updated_at = now() WHERE id = %s",
+                (project_id,),
+            )
+        return {
+            "dimension_dispatches": dispatches,
+            "has_failed_dimensions": has_failed,
+        }
+
+    def _dispatch_multidimensional_specialists(
+        self,
+        *,
+        evaluation_id: UUID,
+        project_id: UUID,
+        project_code: str,
+        project_version_id: UUID,
+        version_number: int,
+        actor_id: UUID,
+        economic_payload: dict[str, Any] | None,
+        economic_event_id: UUID | None,
+        dimensions_to_run: set[str] | None = None,
+        increment_attempt: bool = False,
+    ) -> dict[str, Any]:
+        target_dims = dimensions_to_run if dimensions_to_run is not None else set(self._DIMENSION_ORDER)
+
+        # 1. Ejecutar los 4 especialistas no económicos sobre la misma project_version_id
+        for dim_code in ("social", "environmental", "technical", "legal"):
+            if dim_code not in target_dims:
+                continue
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                self._upsert_dimension_dispatch_with_conn(
+                    conn,
+                    evaluation_id=evaluation_id,
+                    project_id=project_id,
+                    project_version_id=project_version_id,
+                    dimension_code=dim_code,
+                    status="processing",
+                    status_label="En proceso",
+                    error_message=None,
+                    increment_attempt=increment_attempt,
+                )
+            try:
+                outcome = self._execute_specialist_dimension(
+                    dimension_code=dim_code,
+                    evaluation_id=evaluation_id,
+                    project_id=project_id,
+                    project_code=project_code,
+                    project_version_id=project_version_id,
+                    version_number=version_number,
+                    actor_id=actor_id,
+                )
+                with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                    self._upsert_dimension_dispatch_with_conn(
+                        conn,
+                        evaluation_id=evaluation_id,
+                        project_id=project_id,
+                        project_version_id=project_version_id,
+                        dimension_code=dim_code,
+                        status=outcome["status"],
+                        status_label=outcome["status_label"],
+                        result_reference_id=outcome.get("result_reference_id"),
+                        summary=outcome.get("summary"),
+                        error_message=None,
+                        increment_attempt=False,
+                    )
+            except Exception as exc:
+                with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                    self._upsert_dimension_dispatch_with_conn(
+                        conn,
+                        evaluation_id=evaluation_id,
+                        project_id=project_id,
+                        project_version_id=project_version_id,
+                        dimension_code=dim_code,
+                        status="failed",
+                        status_label="Fallido",
+                        error_message=f"Falla en especialista {self._DIMENSION_NAMES[dim_code]}: {exc}"[:400],
+                        increment_attempt=False,
+                    )
+
+        # 2. Despachar especialista económico sobre la misma project_version_id
+        publication_pending = False
+        if "economic" in target_dims and economic_payload is not None:
+            with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                self._upsert_dimension_dispatch_with_conn(
+                    conn,
+                    evaluation_id=evaluation_id,
+                    project_id=project_id,
+                    project_version_id=project_version_id,
+                    dimension_code="economic",
+                    status="processing",
+                    status_label="En proceso",
+                    error_message=None,
+                    increment_attempt=increment_attempt,
+                )
+            if self.dispatcher is None:
+                publication_pending = True
+                with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                    if economic_event_id is not None:
+                        conn.execute(
+                            "UPDATE outbox_events SET publish_attempts=publish_attempts+1 WHERE id=%s",
+                            (economic_event_id,),
+                        )
+                    self._upsert_dimension_dispatch_with_conn(
+                        conn,
+                        evaluation_id=evaluation_id,
+                        project_id=project_id,
+                        project_version_id=project_version_id,
+                        dimension_code="economic",
+                        status="pending",
+                        status_label="Pendiente (en cola)",
+                        summary="Despacho diferido en outbox hasta disponibilidad del broker.",
+                        error_message=None,
+                        increment_attempt=False,
+                    )
+            else:
+                try:
+                    self.dispatcher.dispatch_economic(economic_payload)
+                    with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                        if economic_event_id is not None:
+                            conn.execute(
+                                "UPDATE outbox_events SET published_at=now(), publish_attempts=publish_attempts+1 WHERE id=%s",
+                                (economic_event_id,),
+                            )
+                        ev_now = conn.execute(
+                            """
+                            SELECT e.status, r.economic_assessment_id, r.cost_per_beneficiary_pen, r.score_0_100
+                            FROM evaluations e
+                            LEFT JOIN economic_result_projections r ON r.evaluation_id = e.id
+                            WHERE e.id = %s
+                            """,
+                            (evaluation_id,),
+                        ).fetchone()
+                        if ev_now and ev_now["status"] == "completed" and ev_now.get("economic_assessment_id"):
+                            self._upsert_dimension_dispatch_with_conn(
+                                conn,
+                                evaluation_id=evaluation_id,
+                                project_id=project_id,
+                                project_version_id=project_version_id,
+                                dimension_code="economic",
+                                status="completed",
+                                status_label="Completado",
+                                result_reference_id=ev_now["economic_assessment_id"],
+                                summary=(
+                                    f"Costo por beneficiario S/ {ev_now['cost_per_beneficiary_pen']} "
+                                    f"({ev_now['score_0_100']}/100)."
+                                ),
+                                error_message=None,
+                                increment_attempt=False,
+                            )
+                        elif ev_now and ev_now["status"] == "pending_review":
+                            self._upsert_dimension_dispatch_with_conn(
+                                conn,
+                                evaluation_id=evaluation_id,
+                                project_id=project_id,
+                                project_version_id=project_version_id,
+                                dimension_code="economic",
+                                status="pending_review",
+                                status_label="Pendiente de revisión (HITL)",
+                                summary="Evaluación económica detenida en punto de control de riesgo alto.",
+                                error_message=None,
+                                increment_attempt=False,
+                            )
+                        else:
+                            self._upsert_dimension_dispatch_with_conn(
+                                conn,
+                                evaluation_id=evaluation_id,
+                                project_id=project_id,
+                                project_version_id=project_version_id,
+                                dimension_code="economic",
+                                status="processing",
+                                status_label="En proceso",
+                                summary="Tarea económica encolada para la versión vigente.",
+                                error_message=None,
+                                increment_attempt=False,
+                            )
+                except Exception as exc:
+                    publication_pending = True
+                    with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+                        if economic_event_id is not None:
+                            conn.execute(
+                                "UPDATE outbox_events SET publish_attempts=publish_attempts+1 WHERE id=%s",
+                                (economic_event_id,),
+                            )
+                        self._upsert_dimension_dispatch_with_conn(
+                            conn,
+                            evaluation_id=evaluation_id,
+                            project_id=project_id,
+                            project_version_id=project_version_id,
+                            dimension_code="economic",
+                            status="failed",
+                            status_label="Fallido",
+                            error_message=f"Falla en especialista Económica: {exc}"[:400],
+                            increment_attempt=False,
+                        )
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            rec = self._reconcile_evaluation_state_with_conn(
+                conn,
+                project_id=project_id,
+                project_version_id=project_version_id,
+                evaluation_id=evaluation_id,
+            )
+            return {
+                "publication_pending": publication_pending,
+                "dimension_dispatches": rec["dimension_dispatches"],
+                "has_failed_dimensions": rec["has_failed_dimensions"],
+            }
 
     def request_evaluation(
         self, project_version_id: UUID, actor_id: UUID, idempotency_key: str
     ) -> dict[str, Any]:
         if not idempotency_key.strip():
             raise ConfiguracionPMV1Error("Idempotency-Key es obligatorio")
+        retry_payload: dict[str, Any] | None = None
+        retry_dims: set[str] = set()
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
                 previous = conn.execute(
                     """SELECT e.id AS evaluation_id, e.status, e.project_version_id,
@@ -4196,29 +5865,35 @@ class PlatformService:
                 ).fetchone()
                 if previous:
                     previous = dict(previous)
+                    pv_id_prev = previous["project_version_id"]
                     previous["duplicated"] = True
+                    dispatches = self._get_dimension_dispatches_with_conn(conn, pv_id_prev)
+                    previous["dimension_dispatches"] = dispatches
+                    previous["has_failed_dimensions"] = any(d["status"] == "failed" for d in dispatches)
                     if previous["status"] == "pending_review":
                         previous["event_id"] = None
                         previous["publication_pending"] = False
                         previous["status_label"] = "Pendiente de revisión"
-                        checkpoint = RiskCheckpointEngine.get_active_checkpoint(
-                            conn, previous["project_version_id"]
+                        previous["checkpoint"] = RiskCheckpointEngine.get_active_checkpoint(
+                            conn, pv_id_prev
                         )
-                        previous["checkpoint"] = checkpoint
                     else:
                         previous["status_label"] = None
                         previous["checkpoint"] = None
-                    previous.pop("project_version_id", None)
                     previous.pop("payload", None)
                     return previous
 
                 snapshot = conn.execute(
                     """
-                    SELECT pv.id AS project_version_id, pv.project_id, pv.estimated_budget_pen,
+                    SELECT pv.id AS project_version_id, pv.project_id, p.code AS project_code,
+                           pv.version_number, pv.title, pv.description, pv.location_description AS location,
+                           pv.proposed_land_use, pv.estimated_budget_pen,
                            pv.beneficiaries_count, cv.id AS criteria_version_id,
                            cv.version_number AS criteria_version_number,
                            cv.excellent_cost_pen, cv.unacceptable_cost_pen
-                    FROM project_versions pv CROSS JOIN criteria_versions cv
+                    FROM project_versions pv
+                    JOIN projects p ON p.id = pv.project_id
+                    CROSS JOIN criteria_versions cv
                     WHERE pv.id=%s AND cv.status='active'
                     """,
                     (project_version_id,),
@@ -4228,146 +5903,393 @@ class PlatformService:
                         "Version de proyecto o criterios activos no encontrados"
                     )
 
-                # Comprobar si existe condición de riesgo alto configurada para revisión humana (CA-HU3.1-01)
-                risk_info = RiskCheckpointEngine.detect_high_risk_condition(conn, project_version_id)
-                if risk_info:
-                    evaluation_id = uuid4()
+                missing = self._missing_from_values(dict(snapshot))
+                if missing:
+                    raise ExpedientePMV1IncompletoError(missing)
+
+                # Evitar evaluaciones duplicadas sobre la misma versión (aun con nueva Idempotency-Key):
+                existing_for_ver = conn.execute(
+                    """
+                    SELECT e.id AS evaluation_id, e.status, e.project_version_id,
+                           o.id AS event_id, o.payload,
+                           (o.id IS NOT NULL AND o.published_at IS NULL) AS publication_pending
+                    FROM evaluations e
+                    LEFT JOIN outbox_events o ON o.aggregate_id = e.id
+                    WHERE e.project_version_id = %s
+                    ORDER BY e.requested_at DESC
+                    LIMIT 1
+                    """,
+                    (project_version_id,),
+                ).fetchone()
+                if existing_for_ver:
+                    dispatches = self._get_dimension_dispatches_with_conn(conn, project_version_id)
+                    if dispatches or existing_for_ver["event_id"] is not None:
+                        failed_dims = {d["dimension_code"] for d in dispatches if d["status"] == "failed"}
+                        if not failed_dims:
+                            existing_dict = dict(existing_for_ver)
+                            existing_dict["duplicated"] = True
+                            existing_dict["dimension_dispatches"] = dispatches
+                            existing_dict["has_failed_dimensions"] = False
+                            if existing_dict["status"] == "pending_review":
+                                existing_dict["event_id"] = None
+                                existing_dict["publication_pending"] = False
+                                existing_dict["status_label"] = "Pendiente de revisión"
+                                existing_dict["checkpoint"] = RiskCheckpointEngine.get_active_checkpoint(
+                                    conn, project_version_id
+                                )
+                            else:
+                                existing_dict["status_label"] = None
+                                existing_dict["checkpoint"] = None
+                            existing_dict.pop("payload", None)
+                            return existing_dict
+                        # Recuperación segura de únicamente las dimensiones fallidas sin duplicar las exitosas
+                        retry_dims = failed_dims
+                        retry_payload = {
+                            "evaluation_id": existing_for_ver["evaluation_id"],
+                            "event_id": existing_for_ver["event_id"],
+                            "payload": existing_for_ver["payload"],
+                            "status": existing_for_ver["status"],
+                            "snapshot": dict(snapshot),
+                        }
+
+                if retry_payload is None:
+                    # Comprobar si existe condición de riesgo alto configurada para revisión humana (CA-HU3.1-01)
+                    risk_info = RiskCheckpointEngine.detect_high_risk_condition(conn, project_version_id)
+                    if risk_info:
+                        evaluation_id = uuid4()
+                        conn.execute(
+                            """INSERT INTO evaluations
+                            (id, project_version_id, criteria_version_id, requested_by_user_id,
+                             status, idempotency_key, error_message) VALUES (%s,%s,%s,%s,'pending_review',%s,%s)""",
+                            (
+                                evaluation_id,
+                                project_version_id,
+                                snapshot["criteria_version_id"],
+                                actor_id,
+                                idempotency_key,
+                                risk_info["reason"],
+                            ),
+                        )
+                        checkpoint = RiskCheckpointEngine.create_or_get_checkpoint(
+                            conn,
+                            project_id=snapshot["project_id"],
+                            project_version_id=project_version_id,
+                            evaluation_id=evaluation_id,
+                            risk_info=risk_info,
+                        )
+                        for dim_code in self._DIMENSION_ORDER:
+                            self._upsert_dimension_dispatch_with_conn(
+                                conn,
+                                evaluation_id=evaluation_id,
+                                project_id=snapshot["project_id"],
+                                project_version_id=project_version_id,
+                                dimension_code=dim_code,
+                                status="pending_review",
+                                status_label="Pendiente de revisión (HITL)",
+                                summary="Distribución detenida preventivamente por riesgo alto en punto de control (HU3.1).",
+                            )
+                        dispatches = self._get_dimension_dispatches_with_conn(conn, project_version_id)
+                        return {
+                            "evaluation_id": evaluation_id,
+                            "event_id": None,
+                            "project_version_id": project_version_id,
+                            "status": "pending_review",
+                            "status_label": "Pendiente de revisión",
+                            "duplicated": False,
+                            "publication_pending": False,
+                            "checkpoint": checkpoint,
+                            "dimension_dispatches": dispatches,
+                            "has_failed_dimensions": False,
+                        }
+
+                    evaluation_id, event_id = uuid4(), uuid4()
+                    payload = {
+                        "event_id": str(event_id),
+                        "event_type": "EconomicEvaluationRequested",
+                        "evaluation_id": str(evaluation_id),
+                        "project_version_id": str(snapshot["project_version_id"]),
+                        "criteria_version_id": str(snapshot["criteria_version_id"]),
+                        "budget_pen": str(snapshot["estimated_budget_pen"]),
+                        "beneficiaries_count": snapshot["beneficiaries_count"],
+                        "excellent_cost_pen": str(snapshot["excellent_cost_pen"]),
+                        "unacceptable_cost_pen": str(snapshot["unacceptable_cost_pen"]),
+                        "criteria_version_number": snapshot["criteria_version_number"],
+                        "occurred_at": datetime.now(timezone.utc).isoformat(),
+                        "correlation_id": str(evaluation_id),
+                        "schema_version": 1,
+                    }
                     conn.execute(
                         """INSERT INTO evaluations
                         (id, project_version_id, criteria_version_id, requested_by_user_id,
-                         status, idempotency_key, error_message) VALUES (%s,%s,%s,%s,'pending_review',%s,%s)""",
+                         status, idempotency_key) VALUES (%s,%s,%s,%s,'queued',%s)""",
                         (
                             evaluation_id,
                             project_version_id,
                             snapshot["criteria_version_id"],
                             actor_id,
                             idempotency_key,
-                            risk_info["reason"],
                         ),
                     )
-                    checkpoint = RiskCheckpointEngine.create_or_get_checkpoint(
-                        conn,
-                        project_id=snapshot["project_id"],
-                        project_version_id=project_version_id,
-                        evaluation_id=evaluation_id,
-                        risk_info=risk_info,
+                    conn.execute(
+                        "INSERT INTO outbox_events (id,event_type,aggregate_id,payload) VALUES (%s,'EconomicEvaluationRequested',%s,%s)",
+                        (event_id, evaluation_id, Jsonb(payload)),
                     )
-                    return {
-                        "evaluation_id": evaluation_id,
-                        "event_id": None,
-                        "status": "pending_review",
-                        "status_label": "Pendiente de revisión",
-                        "duplicated": False,
-                        "publication_pending": False,
-                        "checkpoint": checkpoint,
-                    }
-                evaluation_id, event_id = uuid4(), uuid4()
-                payload = {
-                    "event_id": str(event_id),
-                    "event_type": "EconomicEvaluationRequested",
-                    "evaluation_id": str(evaluation_id),
-                    "project_version_id": str(snapshot["project_version_id"]),
-                    "criteria_version_id": str(snapshot["criteria_version_id"]),
-                    "budget_pen": str(snapshot["estimated_budget_pen"]),
-                    "beneficiaries_count": snapshot["beneficiaries_count"],
-                    "excellent_cost_pen": str(snapshot["excellent_cost_pen"]),
-                    "unacceptable_cost_pen": str(snapshot["unacceptable_cost_pen"]),
-                    "criteria_version_number": snapshot["criteria_version_number"],
-                    "occurred_at": datetime.now(timezone.utc).isoformat(),
-                    "correlation_id": str(evaluation_id),
-                    "schema_version": 1,
-                }
-                conn.execute(
-                    """INSERT INTO evaluations
-                    (id, project_version_id, criteria_version_id, requested_by_user_id,
-                     status, idempotency_key) VALUES (%s,%s,%s,%s,'queued',%s)""",
-                    (
-                        evaluation_id,
-                        project_version_id,
-                        snapshot["criteria_version_id"],
-                        actor_id,
-                        idempotency_key,
-                    ),
-                )
-                conn.execute(
-                    "INSERT INTO outbox_events (id,event_type,aggregate_id,payload) VALUES (%s,'EconomicEvaluationRequested',%s,%s)",
-                    (event_id, evaluation_id, Jsonb(payload)),
-                )
-                conn.execute(
-                    "UPDATE projects SET status='evaluating', updated_at=now() WHERE id=%s",
-                    (snapshot["project_id"],),
-                )
-                conn.execute(
-                    """INSERT INTO audit_events
-                    (actor_user_id,action,entity_type,entity_id,details)
-                    VALUES (%s,'EVALUATION_QUEUED','evaluation',%s,%s)""",
-                    (actor_id, evaluation_id, Jsonb({"event_id": str(event_id)})),
-                )
+                    for dim_code in self._DIMENSION_ORDER:
+                        self._upsert_dimension_dispatch_with_conn(
+                            conn,
+                            evaluation_id=evaluation_id,
+                            project_id=snapshot["project_id"],
+                            project_version_id=project_version_id,
+                            dimension_code=dim_code,
+                            status="pending",
+                            status_label="Pendiente",
+                            summary="En cola para distribución automática.",
+                        )
+                    conn.execute(
+                        "UPDATE projects SET status='evaluating', updated_at=now() WHERE id=%s",
+                        (snapshot["project_id"],),
+                    )
+                    conn.execute(
+                        """INSERT INTO audit_events
+                        (actor_user_id,action,entity_type,entity_id,details)
+                        VALUES (%s,'EVALUATION_QUEUED','evaluation',%s,%s)""",
+                        (
+                            actor_id,
+                            evaluation_id,
+                            Jsonb({
+                                "event_id": str(event_id),
+                                "project_version_id": str(project_version_id),
+                                "distributed_dimensions": list(self._DIMENSION_ORDER),
+                            }),
+                        ),
+                    )
 
-        publication_pending = False
-        try:
-            self.dispatcher.dispatch_economic(payload)
+        if retry_payload is not None:
+            snap = retry_payload["snapshot"]
+            sync_res = self._dispatch_multidimensional_specialists(
+                evaluation_id=retry_payload["evaluation_id"],
+                project_id=snap["project_id"],
+                project_code=snap["project_code"],
+                project_version_id=project_version_id,
+                version_number=snap["version_number"],
+                actor_id=actor_id,
+                economic_payload=retry_payload["payload"],
+                economic_event_id=retry_payload["event_id"],
+                dimensions_to_run=retry_dims,
+                increment_attempt=True,
+            )
             with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
-                conn.execute(
-                    "UPDATE outbox_events SET published_at=now(), publish_attempts=publish_attempts+1 WHERE id=%s",
-                    (event_id,),
-                )
-        except Exception:
-            publication_pending = True
-            with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
-                conn.execute(
-                    "UPDATE outbox_events SET publish_attempts=publish_attempts+1 WHERE id=%s",
-                    (event_id,),
-                )
+                cp = RiskCheckpointEngine.get_active_checkpoint(conn, project_version_id)
+                ev_cur = conn.execute("SELECT status FROM evaluations WHERE id=%s", (retry_payload["evaluation_id"],)).fetchone()
+            return {
+                "evaluation_id": retry_payload["evaluation_id"],
+                "event_id": retry_payload["event_id"],
+                "project_version_id": project_version_id,
+                "status": ev_cur["status"] if ev_cur else retry_payload["status"],
+                "status_label": None,
+                "duplicated": True,
+                "publication_pending": sync_res["publication_pending"],
+                "checkpoint": cp,
+                "dimension_dispatches": sync_res["dimension_dispatches"],
+                "has_failed_dimensions": sync_res["has_failed_dimensions"],
+            }
+
+        sync_res = self._dispatch_multidimensional_specialists(
+            evaluation_id=evaluation_id,
+            project_id=snapshot["project_id"],
+            project_code=snapshot["project_code"],
+            project_version_id=project_version_id,
+            version_number=snapshot["version_number"],
+            actor_id=actor_id,
+            economic_payload=payload,
+            economic_event_id=event_id,
+            dimensions_to_run=set(self._DIMENSION_ORDER),
+            increment_attempt=False,
+        )
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            cp = RiskCheckpointEngine.get_active_checkpoint(conn, project_version_id)
+            ev_cur = conn.execute("SELECT status FROM evaluations WHERE id=%s", (evaluation_id,)).fetchone()
+            cur_status = ev_cur["status"] if ev_cur else "queued"
+
         return {
             "evaluation_id": evaluation_id,
-            "event_id": event_id,
-            "status": "queued",
+            "event_id": None if cur_status == "pending_review" else event_id,
+            "project_version_id": project_version_id,
+            "status": "pending_review" if cur_status == "pending_review" else "queued",
+            "status_label": "Pendiente de revisión" if cur_status == "pending_review" else None,
             "duplicated": False,
-            "publication_pending": publication_pending,
-            "checkpoint": None,
+            "publication_pending": sync_res["publication_pending"],
+            "checkpoint": cp,
+            "dimension_dispatches": sync_res["dimension_dispatches"],
+            "has_failed_dimensions": sync_res["has_failed_dimensions"],
         }
+
+    def retry_failed_dimensions(
+        self,
+        project_id: UUID,
+        actor_id: UUID,
+        version_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Recuperación segura: reintenta únicamente dimensiones en estado 'failed' o 'pending' para la versión indicada."""
+        project = self.get_project(project_id)
+        target_vid = version_id or project["project_version_id"]
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            self._verify_version_belongs_to_project(conn, project_id, target_vid)
+            pv_row = conn.execute(
+                """
+                SELECT pv.id AS project_version_id, pv.project_id, pv.version_number,
+                       pv.title, pv.description, pv.location_description AS location,
+                       pv.proposed_land_use, pv.estimated_budget_pen, pv.beneficiaries_count
+                FROM project_versions pv WHERE pv.id = %s
+                """,
+                (target_vid,),
+            ).fetchone()
+            if not pv_row:
+                raise RecursoPMV1NoEncontradoError("Versión no encontrada")
+            missing = self._missing_from_values(dict(pv_row))
+            if missing:
+                raise ExpedientePMV1IncompletoError(missing)
+            if RiskCheckpointEngine.has_pending_checkpoint(conn, target_vid):
+                raise ConfiguracionPMV1Error(
+                    "El expediente se encuentra detenido en un punto de control activo (HU3.1); resuelva la revisión antes de reintentar."
+                )
+            ev_row = conn.execute(
+                """
+                SELECT e.id AS evaluation_id, o.id AS event_id, o.payload
+                FROM evaluations e
+                LEFT JOIN outbox_events o ON o.aggregate_id = e.id
+                WHERE e.project_version_id = %s
+                ORDER BY e.requested_at DESC
+                LIMIT 1
+                """,
+                (target_vid,),
+            ).fetchone()
+            if not ev_row:
+                raise RecursoPMV1NoEncontradoError(
+                    "No existe una distribución previa para reintentar en esta versión."
+                )
+            dispatches = self._get_dimension_dispatches_with_conn(conn, target_vid)
+            target_dims = {d["dimension_code"] for d in dispatches if d["status"] in ("failed", "pending")}
+
+        if target_dims:
+            self._dispatch_multidimensional_specialists(
+                evaluation_id=ev_row["evaluation_id"],
+                project_id=project_id,
+                project_code=project["code"],
+                project_version_id=target_vid,
+                version_number=pv_row["version_number"],
+                actor_id=actor_id,
+                economic_payload=ev_row["payload"],
+                economic_event_id=ev_row["event_id"],
+                dimensions_to_run=target_dims,
+                increment_attempt=True,
+            )
+        return self.get_evaluation(ev_row["evaluation_id"])
+
+    @staticmethod
+    def _build_evaluation_payload(
+        row: dict[str, Any],
+        checkpoint: dict[str, Any] | None,
+        dimension_dispatches: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        result = None
+        if row["status"] != "pending_review" and checkpoint is None and row.get("economic_assessment_id"):
+            socioeconomic = SocioeconomicReturnEngine.evaluate(
+                budget_pen=row.get("estimated_budget_pen"),
+                beneficiaries_count=row.get("beneficiaries_count"),
+                socioeconomic_inputs=None,
+            )
+            result = {
+                "economic_assessment_id": row["economic_assessment_id"],
+                "cost_per_beneficiary_pen": row["cost_per_beneficiary_pen"],
+                "score_0_100": row["score_0_100"],
+                "explanation": row["explanation"],
+                "algorithm_version": row["algorithm_version"],
+                "indicator_name": "Costo por beneficiario",
+                "currency": "PEN",
+                "formula": "presupuesto / beneficiarios",
+                "rounding_rule": "2 decimales (ROUND_HALF_UP)",
+                "budget_pen": row.get("estimated_budget_pen"),
+                "beneficiaries_count": row.get("beneficiaries_count"),
+                **socioeconomic,
+            }
+        dispatches = dimension_dispatches or []
+        has_failed = any(d["status"] == "failed" for d in dispatches)
+        status_label = (
+            "Pendiente de revisión"
+            if row["status"] == "pending_review"
+            else (
+                "Completada con falla en especialista"
+                if (row["status"] == "completed" and has_failed)
+                else (
+                    "Completada"
+                    if row["status"] == "completed"
+                    else (
+                        "En procesamiento"
+                        if row["status"] == "processing"
+                        else ("En cola" if row["status"] == "queued" else row["status"])
+                    )
+                )
+            )
+        )
+        return {
+            "evaluation_id": row["evaluation_id"],
+            "project_version_id": row["project_version_id"],
+            "criteria_version_id": row["criteria_version_id"],
+            "status": row["status"],
+            "status_label": status_label,
+            "checkpoint": checkpoint,
+            "result": result,
+            "dimension_dispatches": dispatches,
+            "has_failed_dimensions": has_failed,
+        }
+
+    def _get_latest_evaluation_for_version_with_conn(
+        self,
+        conn: psycopg.Connection[Any],
+        project_version_id: UUID,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT e.id AS evaluation_id, e.project_version_id, e.criteria_version_id, e.status,
+                   pv.estimated_budget_pen, pv.beneficiaries_count,
+                   r.economic_assessment_id, r.cost_per_beneficiary_pen, r.score_0_100,
+                   r.explanation, r.algorithm_version
+            FROM evaluations e
+            JOIN project_versions pv ON pv.id = e.project_version_id
+            LEFT JOIN economic_result_projections r ON r.evaluation_id = e.id
+            WHERE e.project_version_id = %s
+            ORDER BY e.requested_at DESC
+            LIMIT 1
+            """,
+            (project_version_id,),
+        ).fetchone()
+        if not row:
+            return None
+        dispatches = self._get_dimension_dispatches_with_conn(conn, project_version_id)
+        return self._build_evaluation_payload(dict(row), checkpoint, dispatches)
 
     def get_evaluation(self, evaluation_id: UUID) -> dict[str, Any]:
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
             row = conn.execute(
                 """
-                SELECT e.id AS evaluation_id,e.project_version_id,e.criteria_version_id,e.status,
-                       r.economic_assessment_id,r.cost_per_beneficiary_pen,r.score_0_100,
-                       r.explanation,r.algorithm_version
-                FROM evaluations e LEFT JOIN economic_result_projections r ON r.evaluation_id=e.id
-                WHERE e.id=%s
+                SELECT e.id AS evaluation_id, e.project_version_id, e.criteria_version_id, e.status,
+                       pv.estimated_budget_pen, pv.beneficiaries_count,
+                       r.economic_assessment_id, r.cost_per_beneficiary_pen, r.score_0_100,
+                       r.explanation, r.algorithm_version
+                FROM evaluations e
+                JOIN project_versions pv ON pv.id = e.project_version_id
+                LEFT JOIN economic_result_projections r ON r.evaluation_id = e.id
+                WHERE e.id = %s
                 """,
                 (evaluation_id,),
             ).fetchone()
             if not row:
                 raise RecursoPMV1NoEncontradoError("Evaluacion no encontrada")
             checkpoint = RiskCheckpointEngine.get_active_checkpoint(conn, row["project_version_id"])
-            result = None
-            if row["status"] != "pending_review" and checkpoint is None and row["economic_assessment_id"]:
-                result = {
-                    "economic_assessment_id": row["economic_assessment_id"],
-                    "cost_per_beneficiary_pen": row["cost_per_beneficiary_pen"],
-                    "score_0_100": row["score_0_100"],
-                    "explanation": row["explanation"],
-                    "algorithm_version": row["algorithm_version"],
-                }
-            status_label = "Pendiente de revisión" if row["status"] == "pending_review" else (
-                "Completada" if row["status"] == "completed" else (
-                    "En procesamiento" if row["status"] == "processing" else (
-                        "En cola" if row["status"] == "queued" else row["status"]
-                    )
-                )
-            )
-            return {
-                "evaluation_id": row["evaluation_id"],
-                "project_version_id": row["project_version_id"],
-                "criteria_version_id": row["criteria_version_id"],
-                "status": row["status"],
-                "status_label": status_label,
-                "checkpoint": checkpoint,
-                "result": result,
-            }
+            dispatches = self._get_dimension_dispatches_with_conn(conn, row["project_version_id"])
+            return self._build_evaluation_payload(dict(row), checkpoint, dispatches)
 
     def record_legal_abstention(self, project_id: UUID, actor_id: UUID) -> dict[str, Any]:
         """Mantiene compatibilidad con legal_precheck y devuelve el informe jurídico enriquecido con citas (HU2.2)."""
@@ -4399,6 +6321,70 @@ class PlatformService:
             "findings": assessment["findings"],
         }
 
+    @staticmethod
+    def _compute_legal_assessment_with_conn(
+        conn: psycopg.Connection[Any],
+        project_id: UUID,
+        project: dict[str, Any],
+        version_id: UUID | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        finding_rows = conn.execute(
+            """
+            SELECT * FROM project_legal_findings
+            WHERE project_id = %s AND (project_version_id = %s OR project_version_id IS NULL)
+            ORDER BY created_at ASC
+            """,
+            (project_id, version_id),
+        ).fetchall()
+
+        resolution_row = conn.execute(
+            """
+            SELECT * FROM legal_alert_resolutions
+            WHERE project_id = %s AND project_version_id = %s
+            ORDER BY resolved_at DESC LIMIT 1
+            """,
+            (project_id, version_id),
+        ).fetchone()
+
+        chunk_ids = [r["normative_chunk_id"] for r in finding_rows if r.get("normative_chunk_id")]
+        chunks_by_id: dict[str, dict[str, Any]] = {}
+        if chunk_ids:
+            chunks = conn.execute(
+                "SELECT * FROM normative_documents WHERE id = ANY(%s)",
+                (chunk_ids,),
+            ).fetchall()
+            chunks_by_id = {str(c["id"]): dict(c) for c in chunks}
+
+        assessment = LegalAssessmentEngine.evaluate(
+            project_id=project_id,
+            project_code=project["code"],
+            project_version_id=version_id,
+            finding_rows=[dict(r) for r in finding_rows],
+            chunks_by_id=chunks_by_id,
+        )
+
+        if resolution_row and assessment["has_legal_alert"]:
+            assessment["has_legal_alert"] = False
+            assessment["is_resolved"] = True
+            assessment["resolution_justification"] = resolution_row["justification"]
+
+            all_findings_comply = bool(finding_rows and all(r.get("complies") for r in finding_rows))
+            assessment["status"] = (
+                "verified"
+                if (all_findings_comply and assessment["unverifiable_citations_count"] == 0)
+                else "requires_review"
+            )
+            assessment["status_label"] = (
+                "Alerta Legal Levantada / Citas Verificadas"
+                if assessment["status"] == "verified"
+                else "Alerta Legal Levantada / Requiere revisión de cumplimiento o citas"
+            )
+            assessment["summary"] += (
+                f" [ALERTA LEVANTADA: {resolution_row['resolution_action']} por Asesor Jurídico. "
+                f"Justificación: {resolution_row['justification']}]"
+            )
+        return assessment, resolution_row
+
     def evaluate_legal_assessment(
         self,
         project_id: UUID,
@@ -4407,6 +6393,7 @@ class PlatformService:
     ) -> dict[str, Any]:
         """Ejecuta y persiste la evaluación jurídica del expediente con citas comprobables (HU2.2/HU2.3)."""
         project = self.get_project(project_id)
+        self._ensure_complete_project(project)
         if not _is_db_available(self.db_url):
             raise ServicioNoDisponibleError("Base de datos no disponible")
 
@@ -4417,63 +6404,9 @@ class PlatformService:
             ).fetchone()
             version_id = v_row["id"] if v_row else None
 
-            # Aislamiento por versiones: consultar hallazgos de la versión vigente o generales del proyecto
-            finding_rows = conn.execute(
-                """
-                SELECT * FROM project_legal_findings
-                WHERE project_id = %s AND (project_version_id = %s OR project_version_id IS NULL)
-                ORDER BY created_at ASC
-                """,
-                (project_id, version_id),
-            ).fetchall()
-
-            # Verificar si existe resolución previa de alerta legal para esta versión
-            resolution_row = conn.execute(
-                """
-                SELECT * FROM legal_alert_resolutions
-                WHERE project_id = %s AND project_version_id = %s
-                ORDER BY resolved_at DESC LIMIT 1
-                """,
-                (project_id, version_id),
-            ).fetchone()
-
-            chunk_ids = [r["normative_chunk_id"] for r in finding_rows if r.get("normative_chunk_id")]
-            chunks_by_id: dict[str, dict[str, Any]] = {}
-            if chunk_ids:
-                chunks = conn.execute(
-                    "SELECT * FROM normative_documents WHERE id = ANY(%s)",
-                    (chunk_ids,),
-                ).fetchall()
-                chunks_by_id = {str(c["id"]): dict(c) for c in chunks}
-
-            assessment = LegalAssessmentEngine.evaluate(
-                project_id=project_id,
-                project_code=project["code"],
-                project_version_id=version_id,
-                finding_rows=[dict(r) for r in finding_rows],
-                chunks_by_id=chunks_by_id,
+            assessment, resolution_row = self._compute_legal_assessment_with_conn(
+                conn, project_id, project, version_id
             )
-
-            # Si existía una resolución formal por Asesoría Jurídica para esta versión, aplicar levantamiento
-            if resolution_row and assessment["has_legal_alert"]:
-                assessment["has_legal_alert"] = False
-                assessment["is_resolved"] = True
-                assessment["resolution_justification"] = resolution_row["justification"]
-
-                # HU2.3 Corrección: No marcar como verified sin cambio comprobado en los hallazgos
-                all_findings_comply = bool(finding_rows and all(r.get("complies") for r in finding_rows))
-                assessment["status"] = (
-                    "verified" if (all_findings_comply and assessment["unverifiable_citations_count"] == 0)
-                    else "requires_review"
-                )
-                assessment["status_label"] = (
-                    "Alerta Legal Levantada / Citas Verificadas" if assessment["status"] == "verified"
-                    else "Alerta Legal Levantada / Requiere revisión de cumplimiento o citas"
-                )
-                assessment["summary"] += (
-                    f" [ALERTA LEVANTADA: {resolution_row['resolution_action']} por Asesor Jurídico. "
-                    f"Justificación: {resolution_row['justification']}]"
-                )
 
             assessment_id = UUID(assessment["assessment_id"])
             row_ins = conn.execute(
@@ -4544,6 +6477,12 @@ class PlatformService:
                     }),
                 ),
             )
+            assessment["procurement_verification"] = self._get_procurement_verification_with_conn(
+                conn,
+                project_id=project_id,
+                project_version_id=version_id,
+                version_number=project.get("version_number", 1),
+            )
 
             return assessment
 
@@ -4554,14 +6493,30 @@ class PlatformService:
             raise ServicioNoDisponibleError("Base de datos no disponible")
 
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            current_v_id = project.get("project_version_id")
             row = conn.execute(
-                "SELECT * FROM legal_assessments WHERE project_id = %s",
-                (project_id,),
+                """
+                SELECT * FROM legal_assessments
+                WHERE project_id = %s
+                ORDER BY (project_version_id = %s) DESC NULLS LAST, evaluated_at DESC
+                LIMIT 1
+                """,
+                (project_id, current_v_id),
             ).fetchone()
             if row:
-                current_v_id = project.get("project_version_id")
-                # Aislamiento por versiones: si la versión vigente no coincide, reevaluar limpiamente
+                # Aislamiento por versiones: si la versión vigente no coincide, reevaluar limpiamente o mostrar vista previa si es borrador
                 if row.get("project_version_id") and current_v_id and row["project_version_id"] != current_v_id:
+                    if self._missing_from_values(project):
+                        assessment, _ = self._compute_legal_assessment_with_conn(
+                            conn, project_id, project, current_v_id
+                        )
+                        assessment["procurement_verification"] = self._get_procurement_verification_with_conn(
+                            conn,
+                            project_id=project_id,
+                            project_version_id=current_v_id,
+                            version_number=project.get("version_number", 1),
+                        )
+                        return assessment
                     return self.evaluate_legal_assessment(project_id, UUID("10000000-0000-4000-a000-000000000004"))
 
                 status = row["status"]
@@ -4574,6 +6529,12 @@ class PlatformService:
                 else:
                     status_label = "Requiere revisión humana"
 
+                proc_ver = self._get_procurement_verification_with_conn(
+                    conn,
+                    project_id=project_id,
+                    project_version_id=row.get("project_version_id") or current_v_id,
+                    version_number=project.get("version_number", 1),
+                )
                 return {
                     "assessment_id": str(row["id"]),
                     "project_id": str(row["project_id"]),
@@ -4597,7 +6558,20 @@ class PlatformService:
                         isinstance(f, dict) and f.get("citation", {}).get("is_simulated", False)
                         for f in (row["findings_json"] or [])
                     ),
+                    "procurement_verification": proc_ver,
                 }
+
+            if self._missing_from_values(project):
+                assessment, _ = self._compute_legal_assessment_with_conn(
+                    conn, project_id, project, current_v_id
+                )
+                assessment["procurement_verification"] = self._get_procurement_verification_with_conn(
+                    conn,
+                    project_id=project_id,
+                    project_version_id=current_v_id,
+                    version_number=project.get("version_number", 1),
+                )
+                return assessment
 
         return self.evaluate_legal_assessment(project_id, UUID("10000000-0000-4000-a000-000000000004"))
 
@@ -4822,10 +6796,1367 @@ class PlatformService:
             "duplicated": False,
         }
 
+    # ------------------------------------------------------------------
+    # HU1.10: Verificar Ley de Contrataciones Públicas (Ley N.° 32069)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fetch_procurement_chunks_with_conn(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT id, document_name, short_code, version, topic, content,
+                   in_force, has_alert, data_origin,
+                   official_url, consulted_at, amendments_summary, effective_from
+            FROM normative_documents
+            WHERE short_code IN ('LEY_32069', 'REG_32069', 'LEY_30225', 'LEY_26850', 'LEY_32069_HIST')
+               OR id LIKE 'LEY32069%%'
+               OR id LIKE 'DS009-2025%%'
+               OR id IN ('LEY30225-HIST', 'LEY26850-HIST')
+            ORDER BY in_force DESC, id ASC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _serialize_procurement_verification_row(
+        row: dict[str, Any], *, version_number: int, duplicated: bool = False
+    ) -> dict[str, Any]:
+        con = row.get("consulted_at")
+        return {
+            "verification_id": row["id"],
+            "project_id": row["project_id"],
+            "project_version_id": row["project_version_id"],
+            "version_number": version_number,
+            "status": row["status"],
+            "status_label": row["status_label"],
+            "preliminary_compliant": row["preliminary_compliant"],
+            "requires_human_review": bool(row["requires_human_review"]),
+            "certified_infraction": bool(row["certified_infraction"]),
+            "sent_to_legal_advisor": bool(row["sent_to_legal_advisor"]),
+            "summary": row["summary"],
+            "affected_requirement": row.get("affected_requirement"),
+            "observation_explanation": row.get("observation_explanation"),
+            "missing_fields": row.get("missing_fields_json") or [],
+            "examined_requirements": row.get("examined_requirements_json") or [],
+            "normative_sources": row.get("normative_sources_json") or [],
+            "superseded_sources_excluded": row.get("superseded_sources_excluded_json") or [],
+            "advisory_review_status": row.get("advisory_review_status") or "pending",
+            "advisory_reviewer_id": row.get("advisory_reviewer_id"),
+            "advisory_review_notes": row.get("advisory_review_notes"),
+            "advisory_reviewed_at": row.get("advisory_reviewed_at"),
+            "consulted_at": con.isoformat() if hasattr(con, "isoformat") else (str(con) if con else ProcurementVerificationEngine.CONSULTED_AT),
+            "duplicated": duplicated,
+            "requested_at": row["requested_at"],
+        }
+
+    def _get_procurement_verification_with_conn(
+        self,
+        conn: psycopg.Connection[Any],
+        *,
+        project_id: UUID,
+        project_version_id: UUID | None,
+        version_number: int,
+    ) -> dict[str, Any] | None:
+        if not project_version_id:
+            return None
+        row = conn.execute(
+            """
+            SELECT * FROM procurement_verification_requests
+            WHERE project_id = %s AND project_version_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (project_id, project_version_id),
+        ).fetchone()
+        if not row:
+            return None
+        return self._serialize_procurement_verification_row(dict(row), version_number=version_number)
+
+    def _resolve_target_version(
+        self, conn: psycopg.Connection[Any], project_id: UUID, version_id: UUID | None
+    ) -> dict[str, Any]:
+        if version_id:
+            v_row = conn.execute(
+                """
+                SELECT id, version_number, estimated_budget_pen
+                FROM project_versions
+                WHERE id = %s AND project_id = %s
+                """,
+                (version_id, project_id),
+            ).fetchone()
+        else:
+            v_row = conn.execute(
+                """
+                SELECT id, version_number, estimated_budget_pen
+                FROM project_versions
+                WHERE project_id = %s
+                ORDER BY version_number DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        if not v_row:
+            raise RecursoPMV1NoEncontradoError("Versión de expediente no encontrada para el proyecto")
+        return dict(v_row)
+
+    def get_procurement_antecedents(
+        self, project_id: UUID, version_id: UUID | None = None
+    ) -> dict[str, Any]:
+        """Consulta antecedentes contractuales estructurados y fuentes vigentes de Ley N.° 32069."""
+        self.get_project(project_id)
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            ver = self._resolve_target_version(conn, project_id, version_id)
+            rec = conn.execute(
+                """
+                SELECT * FROM project_procurement_records
+                WHERE project_id = %s AND project_version_id = %s
+                """,
+                (project_id, ver["id"]),
+            ).fetchone()
+            all_chunks = self._fetch_procurement_chunks_with_conn(conn)
+
+        active_sources: list[dict[str, Any]] = []
+        hist_sources: list[dict[str, Any]] = []
+        for c in all_chunks:
+            s = ProcurementVerificationEngine._serialize_source(c)
+            ver_str = str(c.get("version") or "").lower()
+            is_stale = str(c["id"]).startswith("LEY32069-") and ("2024-v1" in ver_str or "histor" in ver_str)
+            if c.get("in_force") and c.get("data_origin") in ("public", "official") and not is_stale:
+                active_sources.append(s)
+            else:
+                hist_sources.append(s)
+
+        if not rec:
+            return {
+                "project_id": project_id,
+                "project_version_id": ver["id"],
+                "version_number": ver["version_number"],
+                "has_record": False,
+                "data_origin": "declared",
+                "active_normative_sources": active_sources,
+                "historical_normative_sources": hist_sources,
+            }
+
+        return {
+            "project_id": project_id,
+            "project_version_id": ver["id"],
+            "version_number": ver["version_number"],
+            "has_record": True,
+            "contracting_regime": rec.get("contracting_regime"),
+            "contract_object": rec.get("contract_object"),
+            "contracting_phase": rec.get("contracting_phase"),
+            "selection_procedure": rec.get("selection_procedure"),
+            "requirement_defined": rec.get("requirement_defined"),
+            "in_cmn_and_viability": rec.get("in_cmn_and_viability"),
+            "budget_certification_declared": rec.get("budget_certification_declared"),
+            "pladicop_registration_planned": rec.get("pladicop_registration_planned"),
+            "no_fractionation_declared": rec.get("no_fractionation_declared"),
+            "supporting_document_ref": rec.get("supporting_document_ref"),
+            "contractual_summary": rec.get("contractual_summary"),
+            "data_origin": rec.get("data_origin") or "declared",
+            "updated_at": rec.get("updated_at"),
+            "active_normative_sources": active_sources,
+            "historical_normative_sources": hist_sources,
+        }
+
+    def upsert_procurement_antecedents(
+        self,
+        *,
+        project_id: UUID,
+        actor_id: UUID,
+        data: ProcurementAntecedentUpsert,
+        version_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Registra o actualiza antecedentes contractuales estrictamente para la versión indicada."""
+        project = self.get_project(project_id)
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            ver = self._resolve_target_version(conn, project_id, version_id)
+            rec_id = uuid4()
+            conn.execute(
+                """
+                INSERT INTO project_procurement_records (
+                    id, project_id, project_version_id, contracting_regime, contract_object,
+                    contracting_phase, selection_procedure, requirement_defined, in_cmn_and_viability,
+                    budget_certification_declared, pladicop_registration_planned, no_fractionation_declared,
+                    supporting_document_ref, contractual_summary, data_origin, updated_by_user_id, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (project_version_id) DO UPDATE SET
+                    contracting_regime = EXCLUDED.contracting_regime,
+                    contract_object = EXCLUDED.contract_object,
+                    contracting_phase = EXCLUDED.contracting_phase,
+                    selection_procedure = EXCLUDED.selection_procedure,
+                    requirement_defined = EXCLUDED.requirement_defined,
+                    in_cmn_and_viability = EXCLUDED.in_cmn_and_viability,
+                    budget_certification_declared = EXCLUDED.budget_certification_declared,
+                    pladicop_registration_planned = EXCLUDED.pladicop_registration_planned,
+                    no_fractionation_declared = EXCLUDED.no_fractionation_declared,
+                    supporting_document_ref = EXCLUDED.supporting_document_ref,
+                    contractual_summary = EXCLUDED.contractual_summary,
+                    data_origin = EXCLUDED.data_origin,
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    updated_at = now()
+                """,
+                (
+                    rec_id,
+                    project_id,
+                    ver["id"],
+                    data.contracting_regime,
+                    data.contract_object,
+                    data.contracting_phase,
+                    data.selection_procedure,
+                    data.requirement_defined,
+                    data.in_cmn_and_viability,
+                    data.budget_certification_declared,
+                    data.pladicop_registration_planned,
+                    data.no_fractionation_declared,
+                    data.supporting_document_ref,
+                    data.contractual_summary,
+                    data.data_origin,
+                    actor_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_events
+                (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, 'PROCUREMENT_ANTECEDENTS_UPDATED', 'project', %s, %s)
+                """,
+                (
+                    actor_id,
+                    project_id,
+                    Jsonb({
+                        "project_code": project["code"],
+                        "project_version_id": str(ver["id"]),
+                        "version_number": ver["version_number"],
+                        "contracting_regime": data.contracting_regime,
+                        "contract_object": data.contract_object,
+                        "selection_procedure": data.selection_procedure,
+                    }),
+                ),
+            )
+
+        return self.get_procurement_antecedents(project_id, version_id=ver["id"])
+
+    def get_procurement_verification(
+        self, project_id: UUID, version_id: UUID | None = None
+    ) -> dict[str, Any] | None:
+        """Consulta en modo solo lectura la última verificación contractual HU1.10 de la versión."""
+        self.get_project(project_id)
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            ver = self._resolve_target_version(conn, project_id, version_id)
+            return self._get_procurement_verification_with_conn(
+                conn,
+                project_id=project_id,
+                project_version_id=ver["id"],
+                version_number=ver["version_number"],
+            )
+
+    def request_procurement_verification(
+        self,
+        *,
+        project_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        version_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Ejecuta la verificación contractual contra Ley N.° 32069 y D.S. N.° 009-2025-EF (HU1.10)."""
+        cleaned_key = idempotency_key.strip()
+        if not cleaned_key:
+            raise ConfiguracionPMV1Error("Idempotency-Key es obligatorio")
+        project = self.get_project(project_id)
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            ver = self._resolve_target_version(conn, project_id, version_id)
+            previous = conn.execute(
+                """
+                SELECT * FROM procurement_verification_requests
+                WHERE idempotency_key = %s AND project_id = %s AND project_version_id = %s
+                """,
+                (cleaned_key, project_id, ver["id"]),
+            ).fetchone()
+            if previous:
+                return self._serialize_procurement_verification_row(
+                    dict(previous),
+                    version_number=ver["version_number"],
+                    duplicated=True,
+                )
+
+            antecedent_row = conn.execute(
+                """
+                SELECT * FROM project_procurement_records
+                WHERE project_id = %s AND project_version_id = %s
+                """,
+                (project_id, ver["id"]),
+            ).fetchone()
+            all_chunks = self._fetch_procurement_chunks_with_conn(conn)
+
+            project_for_version = {**project, "estimated_budget_pen": ver.get("estimated_budget_pen")}
+            evaluated = ProcurementVerificationEngine.evaluate(
+                project=project_for_version,
+                antecedent=dict(antecedent_row) if antecedent_row else None,
+                all_chunks=all_chunks,
+            )
+
+            ver_id = uuid4()
+            now = evaluated["evaluated_at"]
+            conn.execute(
+                """
+                INSERT INTO procurement_verification_requests (
+                    id, project_id, project_version_id, requested_by_user_id, idempotency_key,
+                    status, status_label, preliminary_compliant, requires_human_review,
+                    certified_infraction, sent_to_legal_advisor, summary,
+                    affected_requirement, observation_explanation,
+                    missing_fields_json, examined_requirements_json,
+                    normative_sources_json, superseded_sources_excluded_json,
+                    advisory_review_status, consulted_at, requested_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    ver_id,
+                    project_id,
+                    ver["id"],
+                    actor_id,
+                    cleaned_key,
+                    evaluated["status"],
+                    evaluated["status_label"],
+                    evaluated["preliminary_compliant"],
+                    evaluated["requires_human_review"],
+                    False,
+                    evaluated["sent_to_legal_advisor"],
+                    evaluated["summary"],
+                    evaluated.get("affected_requirement"),
+                    evaluated.get("observation_explanation"),
+                    Jsonb(evaluated["missing_fields"]),
+                    Jsonb(evaluated["examined_requirements"]),
+                    Jsonb(evaluated["normative_sources"]),
+                    Jsonb(evaluated["superseded_sources_excluded"]),
+                    evaluated["advisory_review_status"],
+                    evaluated["consulted_at"],
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE legal_assessments
+                SET procurement_verification_json = %s
+                WHERE project_id = %s AND project_version_id = %s
+                """,
+                (
+                    Jsonb({
+                        "verification_id": str(ver_id),
+                        "status": evaluated["status"],
+                        "status_label": evaluated["status_label"],
+                        "preliminary_compliant": evaluated["preliminary_compliant"],
+                        "sent_to_legal_advisor": evaluated["sent_to_legal_advisor"],
+                        "affected_requirement": evaluated.get("affected_requirement"),
+                        "summary": evaluated["summary"],
+                    }),
+                    project_id,
+                    ver["id"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_events
+                (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, 'PROCUREMENT_VERIFICATION_EXECUTED', 'project', %s, %s)
+                """,
+                (
+                    actor_id,
+                    project_id,
+                    Jsonb({
+                        "project_code": project["code"],
+                        "project_version_id": str(ver["id"]),
+                        "status": evaluated["status"],
+                        "sent_to_legal_advisor": evaluated["sent_to_legal_advisor"],
+                        "affected_requirement": evaluated.get("affected_requirement"),
+                    }),
+                ),
+            )
+            saved = conn.execute(
+                "SELECT * FROM procurement_verification_requests WHERE id = %s",
+                (ver_id,),
+            ).fetchone()
+
+        return self._serialize_procurement_verification_row(
+            dict(saved),
+            version_number=ver["version_number"],
+            duplicated=False,
+        )
+
+    def review_procurement_observation(
+        self,
+        *,
+        project_id: UUID,
+        actor_id: UUID,
+        advisory_review_status: str,
+        advisory_review_notes: str,
+        version_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Registra la validación jurídica humana (LEGAL_ADVISOR) sobre observaciones HU1.10."""
+        self._verify_legal_resolution_actor(actor_id)
+        project = self.get_project(project_id)
+        if not _is_db_available(self.db_url):
+            raise ServicioNoDisponibleError("Base de datos no disponible")
+
+        cleaned_notes = advisory_review_notes.strip()
+        if len(cleaned_notes) < 5:
+            raise ConfiguracionPMV1Error(
+                "Debe consignar una fundamentación jurídica mínima de 5 caracteres."
+            )
+
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
+            ver = self._resolve_target_version(conn, project_id, version_id)
+            target = conn.execute(
+                """
+                SELECT * FROM procurement_verification_requests
+                WHERE project_id = %s AND project_version_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (project_id, ver["id"]),
+            ).fetchone()
+            if not target:
+                raise RecursoPMV1NoEncontradoError(
+                    "No existe verificación contractual previa para la versión vigente del expediente."
+                )
+
+            now = datetime.now(timezone.utc)
+            updated = conn.execute(
+                """
+                UPDATE procurement_verification_requests
+                SET advisory_review_status = %s,
+                    advisory_reviewer_id = %s,
+                    advisory_review_notes = %s,
+                    advisory_reviewed_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    advisory_review_status,
+                    actor_id,
+                    cleaned_notes,
+                    now,
+                    now,
+                    target["id"],
+                ),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO audit_events
+                (actor_user_id, action, entity_type, entity_id, details)
+                VALUES (%s, 'PROCUREMENT_ADVISORY_REVIEW_RECORDED', 'project', %s, %s)
+                """,
+                (
+                    actor_id,
+                    project_id,
+                    Jsonb({
+                        "project_code": project["code"],
+                        "project_version_id": str(ver["id"]),
+                        "verification_id": str(target["id"]),
+                        "advisory_review_status": advisory_review_status,
+                    }),
+                ),
+            )
+
+        return self._serialize_procurement_verification_row(
+            dict(updated),
+            version_number=ver["version_number"],
+            duplicated=False,
+        )
+
+    _PDM_OFFICIAL_URL: ClassVar[str] = (
+        "https://www.gob.pe/institucion/munihuancayo/normas-legales/838304-636-2020-mph-om"
+    )
+    _PDM_MAPS_URL: ClassVar[str] = (
+        "https://www.gob.pe/institucion/munihuancayo/informes-publicaciones/7983599-planos-del-pdm-huancayo-2017-2037"
+    )
+    _PDM_AUTHORITY: ClassVar[str] = "Municipalidad Provincial de Huancayo (MPH)"
+
+    # Registro controlado en servidor de capas GIS oficialmente verificadas (SHA-256 de geometría canónica).
+    # En el repositorio no existe aún una capa GIS vectorial oficial de zonificación del PDM Huancayo
+    # (los planos en gob.pe están en PDF); por ello este registro inicia vacío y NINGUNA capa declarada por
+    # un usuario mediante POST /geospatial-layers pasa por oficial aunque indique data_origin='public'.
+    _VERIFIED_OFFICIAL_ZONING_LAYERS: ClassVar[dict[str, dict[str, Any]]] = {}
+
+    # Huellas verificadas de límites político-administrativos (INEI ig_distrito UBIGEO 120114),
+    # útiles solo como referencia distrital, jamás como zonificación predial.
+    _VERIFIED_ADMIN_BOUNDARY_SHA256S: ClassVar[frozenset[str]] = frozenset(
+        {
+            "71591b5a5491e102f8cc81084fcde8e84564685352b3b2538fcde8e9fe64928b",
+            "dc265829f26fd8724d19169648a180a0bc35e1b7baad8e62cdecea5e374c96b2",
+        }
+    )
+
+    # Catálogo verificado en gob.pe sobre vigencia base y modificaciones parciales del PDM 2017-2037 (El Tambo / Provincia).
+    # Ninguna modificación parcial desactiva la O.M. N.° 636-2020-MPH/OM para todo el distrito.
+    _PDM_MODIFICATION_ORDINANCES: ClassVar[tuple[dict[str, Any], ...]] = (
+        {
+            "ordinance": "O.M. N.° 636-2020-MPH/OM",
+            "publication_date": "2020-05-08",
+            "relation_to_base": "Norma base vigente que aprueba PAT y PDM Huancayo 2017-2037",
+            "scope_type": "base_metropolitana",
+            "scope_summary": "Provincia de Huancayo (incluye El Tambo), salvo predios o tramos con modificación parcial expresa.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/838304-636-2020-mph-om",
+        },
+        {
+            "ordinance": "O.M. N.° 669-2021-MPH/OM",
+            "publication_date": "2021-10-20",
+            "relation_to_base": "Modificación al PDM 2017-2037 (alcance reglamentario/metropolitano)",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Modificación general al PDM 2017-2037 publicada sin delimitación vectorial abierta.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/5947318-669-2021-mph-om",
+        },
+        {
+            "ordinance": "O.M. N.° 743-2023-MPH/CM",
+            "publication_date": "2023-08-21",
+            "relation_to_base": "Modifica O.M. N.° 636-MPH/CM (PDM 2017-2037)",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Modificación de disposiciones del PDM 2017-2037 (sin shapefile consolidado público).",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/4582484-743-2023-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 753-2023-MPH/CM",
+            "publication_date": "2023-12-13",
+            "relation_to_base": "Rectifica errores materiales de O.M. N.° 636-MPH/CM y sus reglamentos",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Rectificación reglamentaria y de errores materiales del PDM Huancayo.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/4953099-753-2023-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 761-2024-MPH/CM",
+            "publication_date": "2024-04-08",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (diseño vial)",
+            "scope_type": "tramo_vial",
+            "scope_summary": "Av. Ferrocarril, tramo Av. Circunvalación (El Tambo) hasta Av. Centenario (San Jerónimo).",
+            "scope_keywords": ("ferrocarril", "circunvalacion"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/5466458-761-2024-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 765-2024-MPH",
+            "publication_date": "2024-06-24",
+            "relation_to_base": "Modificación parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Paraje Virgen de Cocharcas, Anexo de Saños Chico, El Tambo (reducción de ZRP-P a RDM).",
+            "scope_keywords": ("virgen de cocharcas", "sanos chico"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/5847506-765-2024-mph",
+        },
+        {
+            "ordinance": "O.M. N.° 777-2024-MPH/CM",
+            "publication_date": "2024-11-06",
+            "relation_to_base": "Rectificación por error material de O.M. N.° 636-MPH/CM y reglamentos",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Corrección reglamentaria aplicable al texto/cuadros del PDM y sus reglamentos.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6245405-777-2024-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 778-2024-MPH/CM",
+            "publication_date": "2024-12-02",
+            "relation_to_base": "Actualización de Sistema Vial de O.M. N.° 636-MPH/CM (vía colectora específica)",
+            "scope_type": "tramo_vial",
+            "scope_summary": "Vía Colectora Jr. Daniel Alcides Carrión, AA.HH. La Victoria, El Tambo.",
+            "scope_keywords": ("daniel alcides carrion", "la victoria"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6282115-778-2024-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 779-2024-MPH/CM",
+            "publication_date": "2024-12-20",
+            "relation_to_base": "Subsanación de error material en PDM 2017-2037 y reglamentos",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Subsanación general de errores materiales en el PDM 2017-2037 y reglamentos.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6369203-779-2024-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 787-2025-MPH/CM",
+            "publication_date": "2025-04-04",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio 'Asoc. Sucesión Flores Cerrón', sector Saños Chico, El Tambo (ZRP-P a RDM).",
+            "scope_keywords": ("flores cerron", "sanos chico"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6669653-787-2025-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 789-2025-MPH/CM",
+            "publication_date": "2025-04-16",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio en inmediaciones de Vía Arterial A1-II (Av. Túpac Amaru y Av. Unión), Anexo Hualahoyo, El Tambo (PU a RDM).",
+            "scope_keywords": ("tupac amaru", "av. union", "hualahoyo", "hualaoyo"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6736082-789-2025-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 793-2025-MPH/CM",
+            "publication_date": "2025-07-07",
+            "relation_to_base": "Rectificación de error material de O.M. N.° 636-MPH/CM",
+            "scope_type": "rectificacion_reglamento",
+            "scope_summary": "Rectificación reglamentaria/documental del PDM 2017-2037.",
+            "scope_keywords": (),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/6946063-793-2025-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 800-2025-MPH/CM",
+            "publication_date": "2025-09-15",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio Universidad Continental S.A.C. en Jr. Carhuaquero y Prolongación Hilarión, El Tambo (OU a E3).",
+            "scope_keywords": ("carhuaquero", "hilarion", "continental"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/7278067-800-2025-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 818-2025-MPH/CM",
+            "publication_date": "2025-12-19",
+            "relation_to_base": "Modificación parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio ubicado en Av. José Carlos Mariátegui, El Tambo (ZRP-P a CZ).",
+            "scope_keywords": ("mariategui",),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/7573970-818-2025-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 829-2026-MPH/CM",
+            "publication_date": "2026-02-25",
+            "relation_to_base": "Modificación parcial de O.M. N.° 636-MPH/CM (lote específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Lote ubicado en Calle Real y Sebastián Lorente, distrito de El Tambo.",
+            "scope_keywords": ("calle real", "sebastian lorente", "lorente"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/7922811-829-2026-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 834-2026-MPH/CM",
+            "publication_date": "2026-04-15",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio ubicado en Anexo de Cullpa Baja, distrito de El Tambo (ZRP-P a RDM).",
+            "scope_keywords": ("cullpa",),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/8070875-834-2026-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 836-2026-MPH/CM",
+            "publication_date": "2026-05-13",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio ubicado en Av. Progreso, distrito de El Tambo (E1 Educación Básica a Comercio Vecinal CV y RDM).",
+            "scope_keywords": ("av. progreso", "progreso"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/8165508-836-2026-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 838-2026-MPH/CM",
+            "publication_date": "2026-05-13",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio en Vía Arterial A1-II (Av. Túpac Amaru S/N) y Circuito Ecológico Turístico (Av. General Mercado Jarrín), Anexo de Hualahoyo, El Tambo (PU a RDM).",
+            "scope_keywords": ("tupac amaru", "mercado jarrin", "hualahoyo"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/8165556-838-2026-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 839-2026-MPH/CM",
+            "publication_date": "2026-05-13",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (predio específico)",
+            "scope_type": "predio_especifico",
+            "scope_summary": "Predio en calle proyectada S/N adyacente a Av. Mariátegui y Av. Francisca de la Calle, El Tambo (ZRP-P a RDM).",
+            "scope_keywords": ("mariategui", "francisca de la calle"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/8165564-839-2026-mph-cm",
+        },
+        {
+            "ordinance": "O.M. N.° 851-2026-MPH/CM",
+            "publication_date": "2026-11-02",
+            "relation_to_base": "Actualización parcial de O.M. N.° 636-MPH/CM (diseño vial específico)",
+            "scope_type": "tramo_vial",
+            "scope_summary": "Modificación de Diseño Vial de Av. Mariscal Castilla (tramo: La Victoria - Av. Mariátegui), distrito de El Tambo.",
+            "scope_keywords": ("mariscal castilla", "la victoria", "mariategui"),
+            "official_url": "https://www.gob.pe/institucion/munihuancayo/normas-legales/8821705-851-2026-mph-cm",
+        },
+    )
+
+    @staticmethod
+    def _canonical_geojson_sha256(geojson_obj: Any) -> str:
+        return ZoningSourceValidator.canonical_geojson_sha256(geojson_obj)
+
+    @classmethod
+    def _resolve_pdm_amendments_for_location(
+        cls, location: str | None
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Devuelve todas las normas del PDM clasificadas por alcance sobre la ubicación sin desactivar la base."""
+        loc_norm = cls._normalize_use_text(location)
+        amendments: list[dict[str, str]] = []
+        potentially_affected: list[dict[str, str]] = []
+
+        for item in cls._PDM_MODIFICATION_ORDINANCES:
+            stype = item["scope_type"]
+            keywords = item.get("scope_keywords") or ()
+            keyword_hit = bool(keywords) and any(kw in loc_norm for kw in keywords)
+            if stype == "base_metropolitana":
+                app_status = "base_vigente"
+            elif stype == "rectificacion_reglamento":
+                app_status = "alcance_general_reglamentario"
+            elif keyword_hit:
+                app_status = "posible_coincidencia_pendiente_catastro"
+            else:
+                app_status = "otro_predio_sector_el_tambo"
+
+            entry = {
+                "ordinance": item["ordinance"],
+                "publication_date": item["publication_date"],
+                "relation_to_base": item["relation_to_base"],
+                "scope_type": stype,
+                "scope_summary": item["scope_summary"],
+                "applicability_status": app_status,
+                "official_url": item["official_url"],
+            }
+            amendments.append(entry)
+            if app_status == "posible_coincidencia_pendiente_catastro":
+                potentially_affected.append(entry)
+
+        return amendments, potentially_affected
+
+    @classmethod
+    def _match_geojson_feature(
+        cls, geojson_obj: Any, lon: float, lat: float
+    ) -> dict[str, Any] | None:
+        return ZoningSourceValidator.lookup_point(geojson_obj, lon, lat)
+
+    @staticmethod
+    def _normalize_use_text(text: str | None) -> str:
+        raw = (text or "").strip().lower()
+        for src, dst in (("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ñ", "n")):
+            raw = raw.replace(src, dst)
+        return raw
+
+    @classmethod
+    def _fetch_pdm_document_evidence(
+        cls, conn: psycopg.Connection[Any]
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT id, document_name, short_code, version, topic, content, in_force, data_origin
+            FROM normative_documents
+            WHERE short_code = 'PDU_EL_TAMBO' AND in_force = TRUE
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "document": r["document_name"],
+                "version": r["version"],
+                "locator": f"{r['id']} · {r['topic']}",
+                "excerpt": str(r["content"])[:260],
+                "is_spatial_classification": False,
+                "authority": cls._PDM_AUTHORITY,
+                "official_url": cls._PDM_OFFICIAL_URL,
+                "in_force": bool(r["in_force"]),
+                "data_origin": r.get("data_origin"),
+            })
+        return out
+
+    @classmethod
+    def _collect_zoning_risk_notices(
+        cls,
+        conn: psycopg.Connection[Any],
+        project: dict[str, Any],
+    ) -> str | None:
+        """Detecta avisos de riesgo hídrico/ambiental o áreas verdes sin umbral ni polígono oficial."""
+        pv_id = project["project_version_id"]
+        notices: list[str] = []
+
+        env_rec = conn.execute(
+            """
+            SELECT environmental_component, verifiable_evidence, proximity_to_water_meters,
+                   is_in_protected_or_risk_area, source_name, data_origin
+            FROM project_environmental_records
+            WHERE (
+                project_version_id = %s
+                OR (project_version_id IS NULL AND project_id = %s)
+            )
+              AND has_sufficient_data = TRUE
+              AND (
+                  is_in_protected_or_risk_area = TRUE
+                  OR (proximity_to_water_meters IS NOT NULL AND proximity_to_water_meters < 50)
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (pv_id, project["project_id"]),
+        ).fetchone()
+        if env_rec:
+            prox = env_rec.get("proximity_to_water_meters")
+            prox_txt = f"{prox} m" if prox is not None else "no especificada"
+            notices.append(
+                f"Alerta de riesgo ambiental/hídrico para revisión humana ({env_rec['environmental_component']}, "
+                f"origen '{env_rec.get('data_origin')}', distancia declarada a agua: {prox_txt}, fuente: {env_rec.get('source_name')}): "
+                "O.M. N.° 636-2020-MPH/OM (PDUPDM-04) exige respetar zonas no mitigables y fajas marginales, pero NO fija un umbral "
+                "uniforme de 50 m ni acredita delimitación ANA sin Resolución Directoral/polígono oficial; requiere revisión técnica "
+                "y jurídica sin certificar compatibilidad ni incompatibilidad de zonificación."
+            )
+
+        green_rec = conn.execute(
+            """
+            SELECT affectation_type, verifiable_affectation, source_name, data_origin
+            FROM project_green_area_records
+            WHERE (project_version_id = %s OR (project_version_id IS NULL AND (project_id = %s OR project_code = %s)))
+              AND has_sufficient_data = TRUE
+              AND affectation_type IN ('loss', 'encroachment', 'incompatible_conversion', 'perdida', 'superposicion', 'afectacion_no_mitigada')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (pv_id, project["project_id"], project["code"]),
+        ).fetchone()
+        if green_rec:
+            notices.append(
+                f"Riesgo reportado sobre áreas verdes/espacio público (tipo '{green_rec['affectation_type']}', "
+                f"origen '{green_rec.get('data_origin')}', fuente: {green_rec.get('source_name')}): "
+                "contrastar en revisión jurídica y municipal contra PDUPDM-06 sin emitir dictamen zonal sin polígono oficial."
+            )
+
+        return " ".join(notices) if notices else None
+
+    @classmethod
+    def _evaluate_verified_zone_against_pdm_sections(
+        cls,
+        *,
+        zone_code: str,
+        proposed_norm: str,
+        pdm_by_id: dict[str, dict[str, Any]],
+        verified_entry: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """
+        Evalúa únicamente reglas vinculadas explícitamente a secciones normativas vigentes en corpus.
+        No utiliza diccionarios heurísticos de abreviaturas urbanas (RDM/RDA/CZ/I-1/OU/E/H) si no consta
+        el Índice de Usos oficial parametrizado en repositorio.
+        """
+        z_upper = zone_code.strip().upper()
+        # Regla explícita en PDUPDM-04 (O.M. 636-2020-MPH/OM): zonas de riesgo no mitigable o faja marginal
+        if z_upper in ("ZRNM", "FAJA_MARGINAL") and "PDUPDM-04" in pdm_by_id:
+            ref = pdm_by_id["PDUPDM-04"]
+            return {
+                "compatible": False,
+                "section_id": "PDUPDM-04",
+                "section_ref": ref,
+                "reason": "verified_non_mitigable_risk_zone",
+            }
+
+        # Reglas explícitas en PDUPDM-01 y PDUPDM-06 sobre Zona de Recreación Pública (ZRP / ZRP-P / ZRP-A)
+        if z_upper in ("ZRP", "ZRP-P", "ZRP-A") and "PDUPDM-01" in pdm_by_id and "PDUPDM-06" in pdm_by_id:
+            private_commercial_tokens = ("comerci", "vivienda", "habitacion", "industr", "edificacion privada", "centro comercial")
+            green_recreation_tokens = ("recrea", "parque", "area verde", "plaza", "alameda", "arboriz")
+            if any(tok in proposed_norm for tok in private_commercial_tokens):
+                return {
+                    "compatible": False,
+                    "section_id": "PDUPDM-06",
+                    "section_ref": pdm_by_id["PDUPDM-06"],
+                    "reason": "verified_zrp_intangible_incompatibility",
+                }
+            if any(tok in proposed_norm for tok in green_recreation_tokens):
+                return {
+                    "compatible": True,
+                    "section_id": "PDUPDM-01",
+                    "section_ref": pdm_by_id["PDUPDM-01"],
+                    "reason": "verified_zrp_recreation_compatible",
+                }
+
+        # Matriz oficial explícita solo si la capa verificada incluye sección e Índice de Usos oficial aprobado
+        official_matrix = verified_entry.get("official_use_rules") or []
+        for rule in official_matrix:
+            section_id = str(rule.get("section_id") or "")
+            if section_id not in pdm_by_id:
+                continue
+            incomp = [cls._normalize_use_text(str(x)) for x in (rule.get("incompatible_uses") or [])]
+            comp = [cls._normalize_use_text(str(x)) for x in (rule.get("compatible_uses") or [])]
+            if any(tok and (tok in proposed_norm or proposed_norm in tok) for tok in incomp):
+                return {
+                    "compatible": False,
+                    "section_id": section_id,
+                    "section_ref": pdm_by_id[section_id],
+                    "reason": "verified_official_matrix_incompatibility",
+                }
+            if any(tok and (tok in proposed_norm or proposed_norm in tok) for tok in comp):
+                return {
+                    "compatible": True,
+                    "section_id": section_id,
+                    "section_ref": pdm_by_id[section_id],
+                    "reason": "verified_official_matrix_compatibility",
+                }
+
+        # Para abreviaturas como RDM/RDA/CZ/OU/I-1/E/H sin Índice de Usos oficial cargado, abstenemos.
+        return None
+
+    _SYNTHETIC_ZONING_MARKER: ClassVar[str] = "[DATOS SINTÉTICOS DE PRUEBA TÉCNICA]"
+
+    @classmethod
+    def _build_zoning_response_from_row(
+        cls,
+        conn: psycopg.Connection[Any],
+        zrow: dict[str, Any],
+        project: dict[str, Any],
+        *,
+        duplicated: bool = False,
+        extra_evidence: list[dict[str, Any]] | None = None,
+        environmental_risk_notice: str | None = None,
+    ) -> dict[str, Any]:
+        compatible = zrow.get("compatible")
+        status_val = zrow["status"]
+        limitations = zrow["limitations"]
+        amendments, _ = cls._resolve_pdm_amendments_for_location(project.get("location"))
+        if environmental_risk_notice is None:
+            environmental_risk_notice = cls._collect_zoning_risk_notices(conn, project)
+
+        is_synthetic_data = (
+            cls._SYNTHETIC_ZONING_MARKER in str(limitations or "")
+            or cls._SYNTHETIC_ZONING_MARKER in str(zrow.get("source_document") or "")
+        )
+        outside_cov = "fuera de la cobertura territorial" in str(limitations or "").lower()
+        coverage_status = (
+            "inside_coverage"
+            if compatible is not None
+            else ("outside_coverage" if outside_cov else "not_available")
+        )
+        provenance_mode = (
+            "synthetic_rehearsal"
+            if is_synthetic_data
+            else ("verified_official" if compatible is not None else "unverified_abstention")
+        )
+
+        if compatible is True:
+            status_label = (
+                "Compatibilidad preliminar sustentada (SOLO PRUEBA TÉCNICA SINTÉTICA)"
+                if is_synthetic_data
+                else "Compatibilidad preliminar sustentada"
+            )
+            conclusion = (
+                (f"{cls._SYNTHETIC_ZONING_MARKER} Resultado generado únicamente con polígono ficticio de ensayo técnico; NO acredita compatibilidad territorial real. " if is_synthetic_data else "")
+                + f"Compatibilidad preliminar favorable (sujeta a conformidad municipal de GDU) "
+                f"según {zrow.get('source_document')} ({zrow.get('source_version')}, {zrow.get('source_locator')})."
+            )
+            alerts: list[str] = [
+                (
+                    "ENSAYO SINTÉTICO (NO OFICIAL): demuestra el mecanismo espacial con polígono ficticio; no sustituye la fuente oficial de la GDU (MPH)."
+                    if is_synthetic_data
+                    else "Conclusión preliminar basada en fuente territorial oficialmente verificada; el certificado definitivo corresponde a la Gerencia de Desarrollo Urbano (MPH)."
+                )
+            ]
+            flagged = False
+        elif compatible is False:
+            status_label = (
+                "Posible incompatibilidad · Derivado a revisión jurídica (PRUEBA SINTÉTICA)"
+                if is_synthetic_data
+                else "Posible incompatibilidad · Derivado a revisión jurídica"
+            )
+            conclusion = (
+                (f"{cls._SYNTHETIC_ZONING_MARKER} Observación generada únicamente con polígono ficticio de ensayo técnico. " if is_synthetic_data else "")
+                + f"Posible incompatibilidad territorial detectada según "
+                f"{zrow.get('source_document')} ({zrow.get('source_version')}, {zrow.get('source_locator')}). "
+                "Requiere revisión humana del responsable jurídico; no certifica infracción automática."
+            )
+            alerts = [
+                (
+                    "ENSAYO SINTÉTICO (NO OFICIAL): posible incompatibilidad detectada en prueba técnica y señalada para revisión jurídica humana (sin certificar infracción)."
+                    if is_synthetic_data
+                    else "Posible incompatibilidad PDU/PDM registrada y señalada para revisión jurídica humana (sin certificar infracción automática)."
+                )
+            ]
+            flagged = True
+        else:
+            status_label = (
+                "Fuera de cobertura territorial · Información insuficiente"
+                if outside_cov
+                else "Requiere revisión / Información insuficiente"
+            )
+            conclusion = (
+                "Información insuficiente por coordenadas fuera de la cobertura espacial de la capa zonal consultada; no se declara compatibilidad."
+                if outside_cov
+                else (
+                    "No se declara compatibilidad ni incompatibilidad de zonificación: no existe capa GIS vectorial oficial "
+                    "verificada ni verificación catastral frente a modificaciones parciales del PDM Huancayo."
+                )
+            )
+            alerts = [
+                "Las coordenadas del proyecto están fuera del ámbito cubierto por la fuente espacial consultada; requiere verificación municipal."
+                if outside_cov
+                else "No se puede concluir compatibilidad ni incompatibilidad sin capa GIS oficial verificada independientemente, sección normativa aplicable y validación de modificaciones parciales sobre el predio."
+            ]
+            if environmental_risk_notice:
+                alerts.append(environmental_risk_notice)
+            flagged = False
+
+        evidence: list[dict[str, Any]] = []
+        if zrow.get("source_document") and zrow.get("source_locator") and zrow.get("source_excerpt"):
+            evidence.append({
+                "document": zrow["source_document"],
+                "version": zrow.get("source_version") or "2020-OM636",
+                "locator": zrow["source_locator"],
+                "excerpt": zrow["source_excerpt"],
+                "is_spatial_classification": compatible is not None,
+                "authority": (
+                    "ENSAYO TÉCNICO SINTÉTICO (NO OFICIAL)" if is_synthetic_data else cls._PDM_AUTHORITY
+                ),
+                "official_url": None if is_synthetic_data else cls._PDM_OFFICIAL_URL,
+                "in_force": None if is_synthetic_data else True,
+                "data_origin": "simulated" if is_synthetic_data else "public",
+            })
+        if extra_evidence is None:
+            extra_evidence = cls._fetch_pdm_document_evidence(conn)
+        seen_locs = {e["locator"] for e in evidence}
+        for doc_ev in extra_evidence:
+            if doc_ev["locator"] not in seen_locs:
+                evidence.append(doc_ev)
+                seen_locs.add(doc_ev["locator"])
+
+        return {
+            "review_id": zrow["id"],
+            "project_id": project["project_id"],
+            "project_version_id": project["project_version_id"],
+            "status": status_val,
+            "status_label": status_label,
+            "compatible": compatible,
+            "preliminary_conclusion": conclusion,
+            "flagged_for_legal_review": flagged,
+            "location": project.get("location") or "",
+            "proposed_land_use": project.get("proposed_land_use") or "",
+            "territorial_data_origin": project.get("territorial_data_origin") or "declared",
+            "coverage_status": coverage_status,
+            "is_synthetic_data": is_synthetic_data,
+            "provenance_mode": provenance_mode,
+            "base_ordinance_url": cls._PDM_OFFICIAL_URL,
+            "normative_amendments": amendments,
+            "environmental_risk_notice": environmental_risk_notice,
+            "evidence": evidence,
+            "alerts": alerts,
+            "limitations": limitations,
+            "requires_human_review": True,
+            "duplicated": duplicated,
+        }
+
+    def _get_latest_zoning_precheck_with_conn(
+        self, conn: psycopg.Connection[Any], project: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        zrow = conn.execute(
+            """
+            SELECT id, project_version_id, status, compatible,
+                   source_document, source_version, source_locator, source_excerpt, limitations
+            FROM zoning_review_requests
+            WHERE project_version_id = %s
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            (project["project_version_id"],),
+        ).fetchone()
+        if not zrow:
+            return None
+        return self._build_zoning_response_from_row(conn, dict(zrow), project, duplicated=False)
+
+    def get_zoning_precheck(
+        self, project_id: UUID, version_id: UUID | None = None
+    ) -> dict[str, Any] | None:
+        """Consulta en solo lectura el último precheck de zonificación para la versión vigente o indicada (HU1.11)."""
+        project = self.get_project(project_id)
+        target_vid = version_id or project["project_version_id"]
+        with psycopg.connect(self.db_url, row_factory=dict_row) as conn:
+            if version_id is not None:
+                self._verify_version_belongs_to_project(conn, project_id, target_vid)
+                if target_vid != project["project_version_id"]:
+                    pv = conn.execute(
+                        """
+                        SELECT location_description AS location, proposed_land_use, territorial_data_origin
+                        FROM project_versions WHERE id = %s
+                        """,
+                        (target_vid,),
+                    ).fetchone()
+                    project = {
+                        **project,
+                        "project_version_id": target_vid,
+                        "location": pv["location"] if pv else project.get("location"),
+                        "proposed_land_use": pv["proposed_land_use"] if pv else project.get("proposed_land_use"),
+                        "territorial_data_origin": (
+                            pv["territorial_data_origin"] if pv else project.get("territorial_data_origin")
+                        ),
+                    }
+            return self._get_latest_zoning_precheck_with_conn(conn, project)
+
+    def _evaluate_zoning_evidence_with_conn(
+        self, conn: psycopg.Connection[Any], project: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Evalúa compatibilidad PDU/PDM con compuerta estricta de procedencia oficial verificable (HU1.11):
+        1. Ninguna geometría cargada por un usuario con data_origin='public' o texto libre se acepta como oficial.
+        2. Límites administrativos (INEI) jamás clasifican usos de suelo predial.
+        3. Modificaciones parciales aplicables al ámbito/predio impiden dictamen si no puede descartarse su alcance.
+        4. Umbrales no sustentados en secciones oficiales (como 50 m de distancia a agua) y abreviaturas sin Índice
+           de Usos oficial generan aviso de riesgo o revisión humana sin certificar compatibilidad ni incompatibilidad.
+        """
+        pv_id = project["project_version_id"]
+        doc_evidence = self._fetch_pdm_document_evidence(conn)
+        pdm_by_id = {ev["locator"].split(" · ", 1)[0]: ev for ev in doc_evidence}
+        proposed_norm = self._normalize_use_text(project.get("proposed_land_use"))
+        _, potentially_affected_mods = self._resolve_pdm_amendments_for_location(project.get("location"))
+        risk_notice = self._collect_zoning_risk_notices(conn, project)
+
+        lat = project.get("latitude")
+        lon = project.get("longitude")
+        coord_source = (project.get("coordinates_source") or "").strip()
+        has_coords = lat is not None and lon is not None and len(coord_source) >= 3
+        is_simulated_origin = (
+            project.get("territorial_data_origin") == "simulated"
+            or project.get("coordinates_origin") == "simulated"
+        )
+
+        # Revisar capas registradas en la versión vigente aplicando verificación criptográfica/institucional de servidor
+        ignored_admin_boundary = False
+        ignored_unverified_user_layer = False
+        ignored_simulated_layer = False
+        blocked_by_amendment_scope = False
+        blocked_by_missing_rule_section = False
+        blocked_by_pending_risk = False
+        outside_official_coverage = False
+        outside_synthetic_coverage = False
+        amendment_conflict_names: list[str] = []
+
+        synthetic_meta: OfficialZoningSourceMetadata | None = None
+        synthetic_sha256s: set[str] = set()
+        if self.enable_synthetic_zoning_rehearsal:
+            synthetic_meta, synthetic_fc = build_synthetic_rehearsal_zoning_package()
+            ZoningSourceValidator.validate_package(synthetic_meta, synthetic_fc)
+            synthetic_sha256s.add(ZoningSourceValidator.canonical_geojson_sha256(synthetic_fc))
+            synthetic_sha256s.add(
+                ZoningSourceValidator.canonical_geojson_sha256(synthetic_fc["features"][0]["geometry"])
+            )
+
+        allow_simulated_rehearsal = self.enable_synthetic_zoning_rehearsal
+        if has_coords and (not is_simulated_origin or allow_simulated_rehearsal):
+            layers = conn.execute(
+                """
+                SELECT id, layer_name, meaning, source_name, data_origin, geojson_data
+                FROM project_geospatial_layers
+                WHERE project_version_id = %s
+                  AND layer_type = 'territorial_zone'
+                  AND availability_status = 'available'
+                  AND geojson_data IS NOT NULL
+                ORDER BY created_at DESC
+                """,
+                (pv_id,),
+            ).fetchall()
+
+            for layer in layers:
+                combined_meta = f"{layer['layer_name']} {layer['source_name']} {layer['meaning']}".lower()
+                geo_sha256 = self._canonical_geojson_sha256(layer["geojson_data"])
+
+                if geo_sha256 in self._VERIFIED_ADMIN_BOUNDARY_SHA256S or any(
+                    tok in combined_meta for tok in ("ig_distrito", "inei", "limite administrativo", "limite distrital")
+                ):
+                    ignored_admin_boundary = True
+                    continue
+
+                is_synth_match = (
+                    allow_simulated_rehearsal
+                    and layer["data_origin"] == "simulated"
+                    and synthetic_meta is not None
+                    and geo_sha256 in synthetic_sha256s
+                )
+                if layer["data_origin"] in ("simulated", "declared") and not is_synth_match:
+                    ignored_simulated_layer = True
+                    continue
+
+                # Compuerta de procedencia independiente en servidor:
+                # Ni data_origin='public'/'official_cadastre' ni el nombre de una ordenanza escrito en source_name/layer_name
+                # acreditan por sí solos autenticidad oficial; se exige coincidencia verificada en el registro institucional del servidor.
+                if is_synth_match and synthetic_meta is not None:
+                    matched_props = ZoningSourceValidator.lookup_point(
+                        layer["geojson_data"], float(lon), float(lat)
+                    )
+                    if matched_props is None:
+                        outside_synthetic_coverage = True
+                        continue
+                    zone_code_syn = str(matched_props.get("zone_code") or "ZRP").strip().upper()
+                    verified_entry = {
+                        "zone_code": zone_code_syn,
+                        "effective_date": synthetic_meta.effective_date,
+                        "official_source_name": f"{self._SYNTHETIC_ZONING_MARKER} {synthetic_meta.document_title}",
+                        "source_document": f"{self._SYNTHETIC_ZONING_MARKER} {synthetic_meta.document_title}",
+                        "source_version": synthetic_meta.version,
+                        "is_synthetic": True,
+                    }
+                else:
+                    verified_entry = self._VERIFIED_OFFICIAL_ZONING_LAYERS.get(geo_sha256)
+                    if not verified_entry:
+                        ignored_unverified_user_layer = True
+                        continue
+                    if self._match_geojson_feature(layer["geojson_data"], float(lon), float(lat)) is None:
+                        outside_official_coverage = True
+                        continue
+
+                entry_is_synthetic = bool(verified_entry.get("is_synthetic"))
+
+                # Verificar si existen modificaciones parciales posteriores cuyo ámbito/predio pueda afectar esta ubicación
+                layer_cutoff = str(verified_entry.get("effective_date") or "2020-05-08")
+                unresolved_mods = [
+                    m for m in potentially_affected_mods if m["publication_date"] > layer_cutoff
+                ]
+                if unresolved_mods:
+                    blocked_by_amendment_scope = True
+                    amendment_conflict_names = [m["ordinance"] for m in unresolved_mods]
+                    continue
+
+                zone_code = str(verified_entry.get("zone_code") or "").strip().upper()
+                rule_outcome = self._evaluate_verified_zone_against_pdm_sections(
+                    zone_code=zone_code,
+                    proposed_norm=proposed_norm,
+                    pdm_by_id=pdm_by_id,
+                    verified_entry=verified_entry,
+                )
+                if rule_outcome is None:
+                    blocked_by_missing_rule_section = True
+                    continue
+
+                section_ref = rule_outcome["section_ref"]
+                official_doc = str(verified_entry.get("source_document") or section_ref["document"])
+                official_ver = str(verified_entry.get("source_version") or section_ref["version"])
+                synth_prefix = f"{self._SYNTHETIC_ZONING_MARKER} " if entry_is_synthetic else ""
+                if rule_outcome["compatible"] is False:
+                    return {
+                        "status": "evidence_available",
+                        "compatible": False,
+                        "source_document": official_doc,
+                        "source_version": official_ver,
+                        "source_locator": f"Zona {zone_code} · {section_ref['locator']}",
+                        "source_excerpt": (
+                            f"{synth_prefix}Coordenadas ({lat:.5f}, {lon:.5f}) dentro de zona '{zone_code}' ({verified_entry['official_source_name']}); "
+                            f"uso propuesto '{project['proposed_land_use']}' presenta posible incompatibilidad con {rule_outcome['section_id']}. "
+                            + section_ref["excerpt"]
+                        )[:500],
+                        "limitations": (
+                            f"{synth_prefix}Posible incompatibilidad detectada sobre capa {'sintética de ensayo técnico (NO OFICIAL)' if entry_is_synthetic else 'verificada'} "
+                            f"({verified_entry['official_source_name']}, zona '{zone_code}'). "
+                            "Señalada para revisión jurídica humana; no certifica automáticamente una infracción."
+                        ),
+                        "reason": rule_outcome["reason"],
+                        "extra_evidence": doc_evidence[:2],
+                        "environmental_risk_notice": risk_notice,
+                    }
+
+                if rule_outcome["compatible"] is True and risk_notice:
+                    # Riesgo hídrico/ambiental pendiente de verificación ANA/SINAGERD impide declarar compatibilidad favorable
+                    blocked_by_pending_risk = True
+                    continue
+
+                return {
+                    "status": "evidence_available",
+                    "compatible": True,
+                    "source_document": official_doc,
+                    "source_version": official_ver,
+                    "source_locator": f"{section_ref['locator']} · Zona {zone_code}",
+                    "source_excerpt": (
+                        f"{synth_prefix}Coordenadas ({lat:.5f}, {lon:.5f}) dentro de zona '{zone_code}' ({verified_entry['official_source_name']}); "
+                        f"compatible preliminarmente con '{project['proposed_land_use']}' según {rule_outcome['section_id']}. "
+                        + section_ref["excerpt"]
+                    )[:500],
+                    "limitations": (
+                        f"{synth_prefix}Compatibilidad preliminar sustentada con polígono sintético de prueba técnica (NO OFICIAL ni acredita uso de suelo real)."
+                        if entry_is_synthetic
+                        else (
+                            "Compatibilidad preliminar sustentada con capa institucional verificada y O.M. N.° 636-2020-MPH/OM; "
+                            "sujeta a verificación predial y certificado definitivo de la Gerencia de Desarrollo Urbano (MPH)."
+                        )
+                    ),
+                    "reason": rule_outcome["reason"],
+                    "extra_evidence": doc_evidence[:2],
+                    "environmental_risk_notice": risk_notice,
+                }
+
+        # Abstención estricta (CA-HU1.11-03): no emitir compatibilidad ni incompatibilidad si falta procedencia verificada,
+        # delimitación frente a modificaciones parciales, cobertura espacial o regla normativa sustentada en sección oficial.
+        gap_reasons: list[str] = []
+        if not has_coords:
+            gap_reasons.append("el expediente no cuenta con coordenadas geográficas verificables del predio")
+        if is_simulated_origin and not allow_simulated_rehearsal:
+            gap_reasons.append("los datos territoriales del expediente tienen origen simulado")
+        if outside_official_coverage or outside_synthetic_coverage:
+            gap_reasons.append(
+                f"las coordenadas ({lat}, {lon}) se encuentran fuera de la cobertura territorial de la capa zonal consultada"
+            )
+        if ignored_admin_boundary:
+            gap_reasons.append(
+                "el polígono cargado corresponde solo al límite administrativo distrital (INEI ig_distrito UBIGEO 120114), no a zonificación predial"
+            )
+        if ignored_simulated_layer:
+            gap_reasons.append("las capas zonales registradas tienen origen simulado o meramente declarado")
+        if ignored_unverified_user_layer:
+            gap_reasons.append(
+                "la geometría cargada por el usuario carece de verificación oficial independiente (indicar data_origin='public' o escribir el nombre de una ordenanza en source_name/layer_name no acredita autenticidad cartográfica)"
+            )
+        if blocked_by_amendment_scope:
+            gap_reasons.append(
+                "no puede determinarse si modificaciones parciales posteriores a O.M. N.° 636-2020-MPH/OM "
+                f"({', '.join(amendment_conflict_names)}) alcanzan al predio exacto evaluado"
+            )
+        elif potentially_affected_mods:
+            names = ", ".join(m["ordinance"] for m in potentially_affected_mods[:4])
+            gap_reasons.append(
+                f"la ubicación mencionada podría coincidir con modificaciones parciales por predio/tramo del PDM ({names}), "
+                "cuyo perímetro exacto requiere cotejo catastral municipal sin afectar al resto del distrito"
+            )
+        if blocked_by_pending_risk:
+            gap_reasons.append(
+                "existen alertas ambientales o de proximidad hídrica pendientes de verificación técnica (sin certificar compatibilidad)"
+            )
+        if blocked_by_missing_rule_section:
+            gap_reasons.append(
+                "la clasificación zonal detectada carece de Índice de Usos oficial parametrizado en repositorio para esa categoría"
+            )
+        if not doc_evidence:
+            gap_reasons.append("no existen fragmentos vigentes de PDU/PDM en normative_documents")
+        if not self._VERIFIED_OFFICIAL_ZONING_LAYERS and not outside_synthetic_coverage:
+            gap_reasons.append(
+                "no se dispone de una capa GIS vectorial oficial verificada de polígonos de zonificación del PDM Huancayo "
+                "(los planos publicados en gob.pe por la MPH se encuentran en PDF)"
+            )
+
+        synth_lim_prefix = f"{self._SYNTHETIC_ZONING_MARKER} " if outside_synthetic_coverage else ""
+        limitations = (
+            synth_lim_prefix
+            + "Información insuficiente para declarar compatibilidad ni incompatibilidad espacial de zonificación: "
+            + "; ".join(gap_reasons)
+            + ". La norma base vigente es O.M. N.° 636-2020-MPH/OM (no desactivada globalmente), complementada por "
+            "modificaciones parciales por ámbito o predio específico registradas con enlace verificable. "
+            + (f"Aviso de riesgo territorial: {risk_notice} " if risk_notice else "")
+            + "La solicitud no equivale a conformidad territorial ni certifica infracción."
+        )
+        return {
+            "status": "requires_review",
+            "compatible": None,
+            "source_document": None,
+            "source_version": None,
+            "source_locator": None,
+            "source_excerpt": None,
+            "limitations": limitations,
+            "reason": (
+                "outside_spatial_zoning_coverage"
+                if (outside_official_coverage or outside_synthetic_coverage)
+                else "missing_verifiable_spatial_zoning_layer"
+            ),
+            "extra_evidence": doc_evidence[:2],
+            "environmental_risk_notice": risk_notice,
+        }
+
     def request_zoning_precheck(
         self, project_id: UUID, actor_id: UUID, idempotency_key: str
     ) -> dict[str, Any]:
-        """Registra una alerta territorial sin fabricar compatibilidad PDU/PDM."""
+        """Evalúa o abstiene compatibilidad PDU/PDM con sustento territorial versionado (HU1.11)."""
 
         if not idempotency_key.strip():
             raise ConfiguracionPMV1Error("Idempotency-Key es obligatorio")
@@ -4834,19 +8165,16 @@ class PlatformService:
             field
             for field in ("location", "proposed_land_use")
             if not project.get(field)
+            or (isinstance(project.get(field), str) and not project[field].strip())
         ]
         if missing:
             raise ExpedientePMV1IncompletoError(missing)
 
-        limitations = (
-            "No existe un corpus PDU/PDM oficial, versionado y activo ni una capa GIS "
-            "que permita ubicar el predio. La solicitud no equivale a conformidad territorial."
-        )
         with psycopg.connect(self.db_url, row_factory=dict_row) as conn, conn.transaction():
                 previous = conn.execute(
                     """
-                    SELECT id AS review_id, project_version_id, status,
-                           compatible, limitations
+                    SELECT id, project_version_id, status, compatible,
+                           source_document, source_version, source_locator, source_excerpt, limitations
                     FROM zoning_review_requests WHERE idempotency_key=%s
                     """,
                     (idempotency_key,),
@@ -4856,45 +8184,46 @@ class PlatformService:
                         raise ConfiguracionPMV1Error(
                             "Idempotency-Key ya fue utilizada para otro expediente"
                         )
-                    previous_data = dict(previous)
-                    previous_data.pop("project_version_id")
-                    return {
-                        **previous_data,
-                        "project_id": project["project_id"],
-                        "project_version_id": project["project_version_id"],
-                        "location": project["location"],
-                        "proposed_land_use": project["proposed_land_use"],
-                        "territorial_data_origin": project["territorial_data_origin"],
-                        "evidence": [],
-                        "alerts": [
-                            "No se puede concluir compatibilidad sin evidencia territorial versionada."
-                        ],
-                        "requires_human_review": True,
-                        "duplicated": True,
-                    }
+                    return self._build_zoning_response_from_row(
+                        conn, dict(previous), project, duplicated=True
+                    )
 
+                eval_res = self._evaluate_zoning_evidence_with_conn(conn, project)
                 review_id = uuid4()
                 conn.execute(
                     """
                     INSERT INTO zoning_review_requests
-                    (id,project_version_id,requested_by_user_id,idempotency_key,
-                     status,compatible,limitations)
-                    VALUES (%s,%s,%s,%s,'requires_review',NULL,%s)
+                    (id, project_version_id, requested_by_user_id, idempotency_key,
+                     status, compatible, source_document, source_version,
+                     source_locator, source_excerpt, limitations)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         review_id,
                         project["project_version_id"],
                         actor_id,
                         idempotency_key,
-                        limitations,
+                        eval_res["status"],
+                        eval_res["compatible"],
+                        eval_res["source_document"],
+                        eval_res["source_version"],
+                        eval_res["source_locator"],
+                        eval_res["source_excerpt"],
+                        eval_res["limitations"],
                     ),
+                )
+                audit_action = (
+                    "ZONING_INCOMPATIBILITY_FLAGGED"
+                    if eval_res["compatible"] is False
+                    else "ZONING_REVIEW_REQUESTED"
                 )
                 conn.execute(
                     """INSERT INTO audit_events
                     (actor_user_id,action,entity_type,entity_id,details)
-                    VALUES (%s,'ZONING_REVIEW_REQUESTED','zoning_review',%s,%s)""",
+                    VALUES (%s,%s,'zoning_review',%s,%s)""",
                     (
                         actor_id,
+                        audit_action,
                         review_id,
                         Jsonb(
                             {
@@ -4902,30 +8231,68 @@ class PlatformService:
                                 "project_version_id": str(
                                     project["project_version_id"]
                                 ),
-                                "reason": "no_versioned_territorial_evidence",
+                                "status": eval_res["status"],
+                                "compatible": eval_res["compatible"],
+                                "source_document": eval_res["source_document"],
+                                "source_locator": eval_res["source_locator"],
+                                "reason": eval_res["reason"],
                             }
                         ),
                     ),
                 )
+                inserted_row = {
+                    "id": review_id,
+                    "project_version_id": project["project_version_id"],
+                    "status": eval_res["status"],
+                    "compatible": eval_res["compatible"],
+                    "source_document": eval_res["source_document"],
+                    "source_version": eval_res["source_version"],
+                    "source_locator": eval_res["source_locator"],
+                    "source_excerpt": eval_res["source_excerpt"],
+                    "limitations": eval_res["limitations"],
+                }
+                return self._build_zoning_response_from_row(
+                    conn,
+                    inserted_row,
+                    project,
+                    duplicated=False,
+                    extra_evidence=eval_res.get("extra_evidence"),
+                    environmental_risk_notice=eval_res.get("environmental_risk_notice"),
+                )
+
+
+
+    @staticmethod
+    def _serialize_normative_chunk(item: dict[str, Any]) -> dict[str, Any]:
+        eff = item.get("effective_from")
+        con = item.get("consulted_at")
         return {
-            "review_id": review_id,
-            "project_id": project["project_id"],
-            "project_version_id": project["project_version_id"],
-            "status": "requires_review",
-            "compatible": None,
-            "location": project["location"],
-            "proposed_land_use": project["proposed_land_use"],
-            "territorial_data_origin": project["territorial_data_origin"],
-            "evidence": [],
-            "alerts": [
-                "No se puede concluir compatibilidad sin evidencia territorial versionada."
-            ],
-            "limitations": limitations,
-            "requires_human_review": True,
-            "duplicated": False,
+            "id": str(item["id"]),
+            "document_name": str(item.get("document_name") or ""),
+            "short_code": str(item.get("short_code") or ""),
+            "version": str(item.get("version") or ""),
+            "topic": str(item.get("topic") or ""),
+            "content": str(item.get("content") or ""),
+            "in_force": bool(item.get("in_force", False)),
+            "has_alert": bool(item.get("has_alert", False)),
+            "data_origin": str(item.get("data_origin") or "simulated"),
+            "relevance_score": float(item.get("relevance_score", 0.0)),
+            "location": item.get("location"),
+            "official_url": item.get("official_url"),
+            "consulted_at": con.isoformat() if hasattr(con, "isoformat") else (str(con) if con else None),
+            "amendments_summary": item.get("amendments_summary"),
+            "effective_from": eff.isoformat() if hasattr(eff, "isoformat") else (str(eff) if eff else None),
         }
 
-
+    @staticmethod
+    def _is_superseded_or_inactive_chunk(item: dict[str, Any]) -> bool:
+        if not bool(item.get("in_force", False)):
+            return True
+        cid = str(item.get("id") or "")
+        ver = str(item.get("version") or "").lower()
+        if cid.startswith("LEY32069-") and ("2024-v1" in ver or "histor" in ver):
+            return True
+        return False
 
     def search_normatives(
         self,
@@ -4942,6 +8309,35 @@ class PlatformService:
             raise ConfiguracionPMV1Error("La consulta debe tener al menos 2 caracteres")
 
         search_id = uuid4()
+        is_demo_fallback = False
+        historical_excluded: list[dict[str, Any]] = []
+
+        def _partition_and_score(candidate_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            keywords = NormativeSearchEngine.extract_keywords(cleaned_query)
+            active_scored: list[dict[str, Any]] = []
+            hist_scored: list[dict[str, Any]] = []
+            for raw in candidate_rows:
+                item = dict(raw)
+                is_hist = self._is_superseded_or_inactive_chunk(item)
+                if only_in_force and is_hist:
+                    score_h = NormativeSearchEngine.score_chunk(item, cleaned_query, keywords)
+                    if score_h > 0 and NormativeSearchEngine.is_relevant(item, cleaned_query, keywords):
+                        item["relevance_score"] = score_h
+                        item["location"] = NormativeSearchEngine.resolve_location(item)
+                        item["in_force"] = False
+                        hist_scored.append(self._serialize_normative_chunk(item))
+                    continue
+
+                score = NormativeSearchEngine.score_chunk(item, cleaned_query, keywords)
+                if score > 0 and NormativeSearchEngine.is_relevant(item, cleaned_query, keywords):
+                    item["relevance_score"] = score
+                    item["location"] = NormativeSearchEngine.resolve_location(item)
+                    active_scored.append(self._serialize_normative_chunk(item))
+
+            active_scored.sort(key=lambda x: (x["relevance_score"], x["has_alert"]), reverse=True)
+            hist_scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+            return active_scored[:limit], hist_scored[:limit]
+
         try:
             if not _is_db_available(self.db_url):
                 raise psycopg.OperationalError("Database unreachable")
@@ -4961,35 +8357,17 @@ class PlatformService:
 
                 sql = (
                     "SELECT id, document_name, short_code, version, topic, content, "
-                    "in_force, has_alert, data_origin FROM normative_documents WHERE 1=1"
+                    "in_force, has_alert, data_origin, official_url, consulted_at, "
+                    "amendments_summary, effective_from FROM normative_documents WHERE 1=1"
                 )
                 params: list[Any] = []
-                if only_in_force:
-                    sql += " AND in_force = TRUE"
                 if document_filter and document_filter.strip():
                     f = f"%{document_filter.strip()}%"
                     sql += " AND (document_name ILIKE %s OR short_code ILIKE %s)"
                     params.extend([f, f])
 
-                rows = conn.execute(sql, tuple(params)).fetchall()
-
-                keywords = NormativeSearchEngine.extract_keywords(cleaned_query)
-                scored = []
-                for r in rows:
-                    item = dict(r)
-                    score = NormativeSearchEngine.score_chunk(item, cleaned_query, keywords)
-                    if score > 0 and NormativeSearchEngine.is_relevant(
-                        item, cleaned_query, keywords
-                    ):
-                        item["relevance_score"] = score
-                        item["location"] = NormativeSearchEngine.resolve_location(item)
-                        scored.append(item)
-
-                scored.sort(
-                    key=lambda x: (x["relevance_score"], x["has_alert"]),
-                    reverse=True,
-                )
-                results = scored[:limit]
+                rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+                results, historical_excluded = _partition_and_score(rows)
 
                 alerts_found = []
                 for r in results:
@@ -5025,7 +8403,9 @@ class PlatformService:
                                     "document_filter": document_filter.strip()
                                     if document_filter
                                     else None,
+                                    "only_in_force": only_in_force,
                                     "results_count": len(results),
+                                    "historical_excluded_count": len(historical_excluded),
                                     "alerts_count": len(alerts_found),
                                 }
                             ),
@@ -5036,33 +8416,15 @@ class PlatformService:
                 raise ServicioNoDisponibleError(
                     "Servicio de normativa no disponible: la base de datos no responde."
                 ) from err
+            is_demo_fallback = True
             fallback_rows = _load_fallback_seed_documents()
-            if only_in_force:
-                fallback_rows = [r for r in fallback_rows if r["in_force"]]
             if document_filter and document_filter.strip():
                 df_lower = document_filter.strip().lower()
                 fallback_rows = [
                     r for r in fallback_rows
                     if df_lower in r["document_name"].lower() or df_lower in r["short_code"].lower()
                 ]
-
-            keywords = NormativeSearchEngine.extract_keywords(cleaned_query)
-            scored = []
-            for item in fallback_rows:
-                score = NormativeSearchEngine.score_chunk(item, cleaned_query, keywords)
-                if score > 0 and NormativeSearchEngine.is_relevant(
-                    item, cleaned_query, keywords
-                ):
-                    item_copy = dict(item)
-                    item_copy["relevance_score"] = score
-                    item_copy["location"] = NormativeSearchEngine.resolve_location(item_copy)
-                    scored.append(item_copy)
-
-            scored.sort(
-                key=lambda x: (x["relevance_score"], x["has_alert"]),
-                reverse=True,
-            )
-            results = scored[:limit]
+            results, historical_excluded = _partition_and_score(fallback_rows)
 
             alerts_found = []
             for r in results:
@@ -5072,21 +8434,29 @@ class PlatformService:
                     )
             duplicated = False
 
-        disclaimer = (
-            "Material didactico y simulado para el PMV1 en El Tambo, Huancayo. "
-            "La busqueda automatica asiste la consulta pero no emite dictamenes juridicos "
-            "vinculantes ni sustituye el criterio del Asesor Juridico."
-        )
+        if is_demo_fallback:
+            disclaimer = (
+                "MODO DEMOSTRACIÓN (Base de datos no disponible): resultados obtenidos desde el corpus semilla "
+                "local de demostración; NO representan una consulta vigente en base de datos ni emiten dictamen jurídico."
+            )
+        else:
+            disclaimer = (
+                "Consulta ejecutada sobre el corpus normativo indexado en base de datos. "
+                "La búsqueda automática asiste al Asesor Jurídico mostrando norma, versión y fragmento verificable, "
+                "sin emitir dictámenes vinculantes ni sustituir su análisis profesional."
+            )
 
         return {
             "query": cleaned_query,
             "document_filter": document_filter.strip() if document_filter else None,
             "total_results": len(results),
             "results": results,
+            "historical_references_excluded": historical_excluded,
             "alerts_found": alerts_found,
             "disclaimer": disclaimer,
             "requires_human_review": bool(alerts_found),
             "duplicated": duplicated,
+            "is_demo_fallback": is_demo_fallback,
         }
 
     def list_normative_documents(self) -> list[dict[str, Any]]:
@@ -5097,10 +8467,14 @@ class PlatformService:
                 rows = conn.execute(
                     """
                     SELECT short_code, document_name, version, in_force, data_origin,
-                           COUNT(*)::int AS chunks_count
+                           COUNT(*)::int AS chunks_count,
+                           MIN(official_url) AS official_url,
+                           MAX(consulted_at)::text AS consulted_at,
+                           MAX(effective_from)::text AS effective_from,
+                           MAX(amendments_summary) AS amendments_summary
                     FROM normative_documents
                     GROUP BY short_code, document_name, version, in_force, data_origin
-                    ORDER BY short_code
+                    ORDER BY in_force DESC, short_code ASC, version DESC
                     """
                 ).fetchall()
             return [dict(r) for r in rows]
@@ -5123,6 +8497,10 @@ class PlatformService:
                     "in_force": in_f,
                     "data_origin": origin,
                     "chunks_count": count,
+                    "official_url": None,
+                    "consulted_at": None,
+                    "effective_from": None,
+                    "amendments_summary": "Modo demostración local (sin conexión a BD).",
                 })
             return res
 
@@ -5187,6 +8565,8 @@ class PlatformService:
                 econ_justification = "No se ha solicitado la proyeccion de costo por beneficiario para esta version del expediente."
                 econ_score = None
                 econ_eval_at = None
+                econ_has_blocker = False
+                econ_blocker_msg = None
                 missing_dimensions.append("Economica")
             elif econ_row["status"] == "pending_review":
                 econ_status = "blocked"
@@ -5195,29 +8575,47 @@ class PlatformService:
                 econ_justification = econ_row.get("error_message") or "Detencion preventiva conforme a HU3.1."
                 econ_score = None
                 econ_eval_at = econ_row["requested_at"]
+                econ_has_blocker = True
+                econ_blocker_msg = "Pausa en punto de control"
                 missing_dimensions.append("Economica (Detenida por HITL)")
                 blocking_reasons.append("Dimension economica detenida por punto de control de riesgo alto.")
-            elif econ_row["status"] == "error":
+            elif econ_row["status"] in ("error", "failed"):
                 econ_status = "failed"
                 econ_label = "Evaluacion fallida"
                 econ_conclusion = "La evaluacion economica genero un error."
                 econ_justification = econ_row.get("error_message") or "Error en calculo de costo por beneficiario."
                 econ_score = None
                 econ_eval_at = econ_row["requested_at"]
+                econ_has_blocker = True
+                econ_blocker_msg = "La evaluacion economica fallo y debe reejecutarse."
                 missing_dimensions.append("Economica (Fallida)")
+                blocking_reasons.append("Dimension economica fallida: requiere correccion y nueva ejecucion (CA-HU1.12-03).")
+            elif econ_row["status"] != "completed" or econ_row.get("score_0_100") is None:
+                econ_status = "pending"
+                econ_label = "En proceso" if econ_row["status"] in ("queued", "processing") else "Pendiente de cierre"
+                econ_conclusion = "Evaluacion economica aun en curso o sin proyeccion de puntaje disponible."
+                econ_justification = (
+                    f"Estado actual de la evaluacion economica: '{econ_row['status']}'. "
+                    "Aun no cuenta con puntaje consolidado en economic_result_projections."
+                )
+                econ_score = None
+                econ_eval_at = econ_row["requested_at"]
+                econ_has_blocker = False
+                econ_blocker_msg = None
+                missing_dimensions.append("Economica (Pendiente)")
             else:
-                econ_score = float(econ_row["score_0_100"]) if econ_row.get("score_0_100") is not None else None
+                econ_score = float(econ_row["score_0_100"])
                 cost_pen = econ_row.get("cost_per_beneficiary_pen")
                 cost_str = f"S/. {cost_pen:.2f}" if cost_pen is not None else "No determinado"
                 econ_status = "completed"
                 econ_label = "Completada"
                 econ_conclusion = (
                     f"Costo por beneficiario: {cost_str}. Puntuacion normalizada: {econ_score:.1f}/100."
-                    if econ_score is not None
-                    else f"Costo por beneficiario: {cost_str}."
                 )
                 econ_justification = econ_row.get("explanation") or "Proyeccion de costo por beneficiario conforme a umbrales vigentes."
                 econ_eval_at = econ_row["requested_at"]
+                econ_has_blocker = False
+                econ_blocker_msg = None
 
             dimensions.append({
                 "dimension_code": "economic",
@@ -5229,8 +8627,8 @@ class PlatformService:
                 "score": econ_score,
                 "is_simulated": False,
                 "warning": None,
-                "has_blocker": (econ_status == "blocked"),
-                "blocker_message": "Pausa en punto de control" if econ_status == "blocked" else None,
+                "has_blocker": econ_has_blocker,
+                "blocker_message": econ_blocker_msg,
                 "evaluated_at": econ_eval_at,
                 "details": {
                     "cost_per_beneficiary_pen": float(econ_row["cost_per_beneficiary_pen"])
@@ -5262,20 +8660,24 @@ class PlatformService:
                 soc_eval_at = None
                 soc_simulated = False
                 soc_warning = None
+                soc_has_blocker = False
+                soc_blocker_msg = None
                 missing_dimensions.append("Social")
             else:
                 soc_score = float(soc_row["social_score"]) if soc_row.get("social_score") is not None else None
                 soc_simulated = bool(
-                    soc_row.get("results_json")
-                    and any(r.get("is_simulated") for r in soc_row["results_json"] if isinstance(r, dict))
+                    (
+                        soc_row.get("results_json")
+                        and any(r.get("is_simulated") for r in soc_row["results_json"] if isinstance(r, dict))
+                    )
+                    or (isinstance(soc_row.get("equity_json"), dict) and soc_row["equity_json"].get("is_simulated"))
                 )
                 soc_warning = (
                     "Datos de accesibilidad calculados a partir de fuentes simuladas (RENAES/MINEDU)"
                     if soc_simulated
                     else None
                 )
-                soc_status = "completed" if soc_row["status"] in ("verified", "evaluated", "completed") else "warning"
-                soc_label = "Completada" if soc_status == "completed" else "Requiere revision"
+                raw_soc_status = str(soc_row.get("status") or "").strip().lower()
                 soc_conclusion = soc_row.get("summary") or "Evaluacion social registrada."
                 soc_justification = (
                     soc_row.get("score_explanation")
@@ -5283,6 +8685,31 @@ class PlatformService:
                     or "Analisis de cobertura y equidad social territorial."
                 )
                 soc_eval_at = soc_row["evaluated_at"]
+
+                # SocialAccessibilityEngine guarda 'complete'; registros historicos pueden usar 'completed'/'verified'/'evaluated'.
+                if raw_soc_status in ("complete", "verified", "evaluated", "completed") and soc_score is not None:
+                    soc_status = "completed"
+                    soc_label = "Completada"
+                    soc_has_blocker = False
+                    soc_blocker_msg = None
+                elif raw_soc_status == "insufficient" or soc_score is None:
+                    soc_status = "failed"
+                    soc_label = "Informacion insuficiente"
+                    soc_has_blocker = True
+                    soc_blocker_msg = "Datos de accesibilidad o equidad social insuficientes (HU1.4/HU1.5)."
+                    soc_warning = soc_warning or "Falta cobertura social minima para validar el expediente."
+                    missing_dimensions.append("Social (Informacion insuficiente)")
+                    blocking_reasons.append(f"Dimension social con informacion insuficiente: {soc_conclusion}")
+                else:
+                    soc_status = "warning"
+                    soc_label = "Parcial / Requiere verificacion" if raw_soc_status == "partial" else "Requiere revision"
+                    soc_has_blocker = True
+                    soc_blocker_msg = "Dimension social incompleta o parcial: faltan indicadores indispensables de cobertura o equidad."
+                    soc_warning = soc_warning or "Evaluacion social parcial: no acredita cobertura completa en todas las categorias (HU1.4/HU1.5)."
+                    missing_dimensions.append("Social (Parcial / Incompleta)")
+                    blocking_reasons.append(
+                        f"Dimension social parcial o incompleta ({raw_soc_status or 'sin estado'}): {soc_conclusion}"
+                    )
 
             dimensions.append({
                 "dimension_code": "social",
@@ -5294,8 +8721,8 @@ class PlatformService:
                 "score": soc_score,
                 "is_simulated": soc_simulated,
                 "warning": soc_warning,
-                "has_blocker": False,
-                "blocker_message": None,
+                "has_blocker": soc_has_blocker,
+                "blocker_message": soc_blocker_msg,
                 "evaluated_at": soc_eval_at,
                 "details": {"social_score": soc_score},
             })
@@ -5332,10 +8759,12 @@ class PlatformService:
                 risk = env_row.get("risk_level", "low")
                 req_rev = env_row.get("requires_human_review", False)
                 env_eval_at = env_row["evaluated_at"]
+                green_json = env_row.get("green_area_json")
+                green_insufficient = isinstance(green_json, dict) and (green_json.get("has_sufficient_data") is False)
 
                 env_simulated = bool(
                     (env_row.get("declared_vs_evidence_json") and env_row["declared_vs_evidence_json"].get("is_simulated"))
-                    or (env_row.get("green_area_json") and env_row["green_area_json"].get("is_simulated"))
+                    or (green_json and green_json.get("is_simulated"))
                 )
                 env_warning = "Datos ambientales calculados a partir de capas cartograficas simuladas" if env_simulated else None
 
@@ -5347,8 +8776,12 @@ class PlatformService:
                     env_label = "Informacion insuficiente"
                     env_conclusion = "Informacion ambiental insuficiente para dictaminar."
                     env_justification = env_row.get("risk_observation") or "Faltan datos cartograficos o declarados indispensables."
+                    env_has_blocker = True
                     env_blocker_msg = "Datos ambientales indispensables no provistos."
                     missing_dimensions.append("Ambiental (Informacion insuficiente)")
+                    blocking_reasons.append(
+                        f"Dimension ambiental con informacion insuficiente (CA-HU1.12-03): {env_justification}"
+                    )
                 elif env_has_blocker:
                     env_status = "blocked"
                     env_label = "Alerta de Riesgo Alto (HITL)"
@@ -5356,6 +8789,24 @@ class PlatformService:
                     env_justification = env_row.get("risk_observation") or "Requiere autorizacion y levantamiento de pausa en punto de control (HU3.1/HU3.4)."
                     env_blocker_msg = "Riesgo ambiental territorial alto activo sin resolver (HU3.1)."
                     blocking_reasons.append(f"Dimension ambiental con riesgo alto pendiente de revision humana: {env_justification}")
+                elif env_score is None or green_insufficient:
+                    env_status = "failed"
+                    env_label = "Informacion insuficiente"
+                    env_conclusion = (
+                        f"Nivel de riesgo ambiental: {risk.upper()}, pero faltan datos o puntaje indispensable "
+                        "de areas verdes/conservacion (HU1.7)."
+                    )
+                    env_justification = (
+                        env_row.get("risk_observation")
+                        or env_row.get("summary")
+                        or "Faltan datos indispensables para calcular el puntaje ambiental."
+                    )
+                    env_has_blocker = True
+                    env_blocker_msg = "Faltan datos o puntaje ambiental indispensable (HU1.7/CA-HU1.12-03)."
+                    missing_dimensions.append("Ambiental (Sin datos o puntaje de conservacion)")
+                    blocking_reasons.append(
+                        "Dimension ambiental sin datos suficientes de conservacion/areas verdes o sin puntaje cuantitativo (HU1.7/CA-HU1.12-03)."
+                    )
                 else:
                     env_status = "completed" if risk in ("low", "moderate") or not has_pending_cp else "warning"
                     env_label = "Completada / Favorable" if env_row.get("favorable") else f"Completada ({risk.capitalize()})"
@@ -5404,6 +8855,8 @@ class PlatformService:
                 tech_eval_at = None
                 tech_simulated = False
                 tech_warning = None
+                tech_has_blocker = False
+                tech_blocker_msg = None
                 missing_dimensions.append("Tecnica")
             else:
                 tech_score = float(tech_row["technical_score"]) if tech_row.get("technical_score") is not None else None
@@ -5416,24 +8869,43 @@ class PlatformService:
                     if tech_simulated
                     else None
                 )
-                if tech_row["overall_result"] == "cumple":
-                    tech_status = "completed"
-                    tech_label = "Viable (Cumple)"
-                elif tech_row["overall_result"] == "observado":
-                    tech_status = "warning"
-                    tech_label = "Observado"
-                elif tech_row["overall_result"] == "informacion_insuficiente":
-                    tech_status = "failed"
-                    tech_label = "Informacion insuficiente"
-                    missing_dimensions.append("Tecnica (Informacion insuficiente)")
-                else:
-                    tech_status = "failed"
-                    tech_label = tech_row.get("overall_result_label") or "No viable"
-                    missing_dimensions.append(f"Tecnica ({tech_label})")
-
+                overall_result = str(tech_row.get("overall_result") or "").strip().lower()
                 tech_conclusion = tech_row["dimension_conclusion"]
                 tech_justification = tech_row["dimension_justification"]
                 tech_eval_at = tech_row["evaluated_at"]
+
+                if overall_result == "cumple" and tech_score is not None:
+                    tech_status = "completed"
+                    tech_label = "Viable (Cumple)"
+                    tech_has_blocker = False
+                    tech_blocker_msg = None
+                elif overall_result == "observado":
+                    tech_status = "warning"
+                    tech_label = "Observado"
+                    tech_has_blocker = True
+                    tech_blocker_msg = "Viabilidad tecnica observada: requiere subsanacion antes de aprobacion definitiva (HU1.8)."
+                    missing_dimensions.append("Tecnica (Observado)")
+                    blocking_reasons.append(
+                        f"Dimension tecnica en estado 'observado' (no viable): {tech_conclusion}"
+                    )
+                elif overall_result == "informacion_insuficiente":
+                    tech_status = "failed"
+                    tech_label = "Informacion insuficiente"
+                    tech_has_blocker = True
+                    tech_blocker_msg = "Datos tecnicos indispensables no provistos (HU1.8)."
+                    missing_dimensions.append("Tecnica (Informacion insuficiente)")
+                    blocking_reasons.append(
+                        f"Dimension tecnica con informacion insuficiente (CA-HU1.12-03): {tech_conclusion}"
+                    )
+                else:
+                    tech_status = "failed"
+                    tech_label = tech_row.get("overall_result_label") or "No viable"
+                    tech_has_blocker = True
+                    tech_blocker_msg = "Viabilidad tecnica no cumplida."
+                    missing_dimensions.append(f"Tecnica ({tech_label})")
+                    blocking_reasons.append(
+                        f"Dimension tecnica no viable ({tech_label}): {tech_conclusion}"
+                    )
 
             dimensions.append({
                 "dimension_code": "technical",
@@ -5445,8 +8917,8 @@ class PlatformService:
                 "score": tech_score,
                 "is_simulated": tech_simulated,
                 "warning": tech_warning,
-                "has_blocker": (tech_status == "failed"),
-                "blocker_message": "Viabilidad tecnica observada o no cumplida" if tech_status == "failed" else None,
+                "has_blocker": tech_has_blocker,
+                "blocker_message": tech_blocker_msg,
                 "evaluated_at": tech_eval_at,
                 "details": {"technical_score": tech_score},
             })
@@ -5496,20 +8968,22 @@ class PlatformService:
                     legal_has_blocker = True
                     legal_blocker_msg = f"Alerta Legal activa: {motive} [{norm}]."
                     blocking_reasons.append(f"Dimension juridica con Alerta Legal activa sin resolver (HU2.3): {motive}")
-                elif unverifiable > 0 or legal_row.get("requires_human_review") or legal_row.get("status") == "requires_review":
+                elif unverifiable > 0 or legal_row.get("requires_human_review") or legal_row.get("status") != "verified":
                     legal_status = "warning"
                     legal_label = "Requiere revision humana"
                     legal_conclusion = legal_row.get("summary") or "Revision juridica con citas no comprobables o dictamen pendiente."
                     legal_justification = (
                         f"Se detectaron {unverifiable} cita(s) no verificable(s) (HU2.2); requiere cotejo manual por el Asesor Juridico."
                         if unverifiable > 0
-                        else "Evaluacion juridica en estado 'requires_review' pendiente de subsanacion o dictamen formal."
+                        else f"Evaluacion juridica en estado '{legal_row.get('status')}' pendiente de subsanacion o dictamen formal."
                     )
                     legal_has_blocker = True
                     legal_blocker_msg = "Dimension juridica requiere revision humana formal (HU2.2/HU1.12)."
                     legal_warning = "Contiene citas no comprobables contra normativa oficial o dictamen pendiente."
                     missing_dimensions.append("Juridica (Requiere revision humana)")
-                    blocking_reasons.append("Dimension juridica en estado 'requires_review' por citas normativas no verificables o dictamen legal pendiente (HU2.2/HU1.12).")
+                    blocking_reasons.append(
+                        f"Dimension juridica en estado '{legal_row.get('status')}' por citas normativas no verificables o dictamen legal pendiente (HU2.2/HU1.12)."
+                    )
                 else:
                     legal_status = "completed"
                     legal_label = "Citas normativas verificadas"
@@ -5518,6 +8992,35 @@ class PlatformService:
                     legal_has_blocker = False
                     legal_blocker_msg = None
                     legal_warning = None
+
+            # HU1.10: Si la verificación contractual vigente detectó posible incompatibilidad sin validación compatible de Asesoría Jurídica,
+            # se bloquea la aprobación definitiva hasta que sea revisada o subsanada.
+            proc_ver_row = conn.execute(
+                """
+                SELECT status, advisory_review_status, affected_requirement
+                FROM procurement_verification_requests
+                WHERE project_id = %s AND project_version_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (project_id, current_version_id),
+            ).fetchone()
+            if (
+                proc_ver_row
+                and proc_ver_row["status"] == "possible_incompatibility"
+                and proc_ver_row["advisory_review_status"] in ("pending", "confirmed_incompatibility", "subsanacion_requerida")
+            ):
+                req_txt = proc_ver_row.get("affected_requirement") or "Ley N.° 32069"
+                legal_has_blocker = True
+                legal_blocker_msg = (
+                    f"Posible incompatibilidad contractual (HU1.10) en '{req_txt}' "
+                    f"(revisión jurídica: {proc_ver_row['advisory_review_status']})."
+                )
+                if legal_status == "completed":
+                    legal_status = "warning"
+                    legal_label = "Observación contractual pendiente (HU1.10)"
+                    missing_dimensions.append("Juridica (Observacion contractual HU1.10)")
+                blocking_reasons.append(legal_blocker_msg)
 
             dimensions.append({
                 "dimension_code": "legal",
@@ -5537,6 +9040,40 @@ class PlatformService:
                     "unverifiable_citations_count": legal_row.get("unverifiable_citations_count", 0) if legal_row else 0,
                 },
             })
+
+            # Integrar estados observables de distribución (HU1.1) si alguna dimensión falló o sigue en proceso
+            dispatch_rows = self._get_dimension_dispatches_with_conn(conn, current_version_id)
+            dispatch_by_code = {d["dimension_code"]: d for d in dispatch_rows}
+            for dim in dimensions:
+                d_row = dispatch_by_code.get(dim["dimension_code"])
+                if not d_row:
+                    continue
+                if d_row["status"] == "failed":
+                    dim["status"] = "failed"
+                    dim["status_label"] = "Evaluacion fallida"
+                    dim["conclusion"] = f"Error en especialista {dim['dimension_name']}."
+                    dim["justification"] = d_row.get("error_message") or "Error durante ejecución del especialista; requiere recuperación."
+                    dim["score"] = None
+                    dim["has_blocker"] = True
+                    dim["blocker_message"] = d_row.get("error_message") or "Especialista fallido; requiere reintento."
+                    if dim["dimension_code"] == "economic":
+                        econ_score = None
+                    elif dim["dimension_code"] == "social":
+                        soc_score = None
+                    elif dim["dimension_code"] == "environmental":
+                        env_score = None
+                    elif dim["dimension_code"] == "technical":
+                        tech_score = None
+                    tag = f"{dim['dimension_name']} (Fallida)"
+                    if tag not in missing_dimensions and dim["dimension_name"] not in missing_dimensions:
+                        missing_dimensions.append(tag)
+                    blocking_reasons.append(
+                        f"Dimension {dim['dimension_name'].lower()} fallida (CA-HU1.1-02 / CA-HU1.12-03): {dim['justification']}"
+                    )
+                elif d_row["status"] == "processing" and dim["status"] == "pending":
+                    dim["status"] = "pending"
+                    dim["status_label"] = "En proceso"
+                    dim["conclusion"] = f"Especialista {dim['dimension_name']} en ejecución para esta versión."
 
             # ---------------------------------------------------------
             # 6. Puntuacion Global Explicable (CA-HU1.12-02 & CA-HU1.12-03)
@@ -5594,10 +9131,25 @@ class PlatformService:
             is_score_calculated = False
             formula_text = ""
             explanation_text = ""
+            score_blocker_reason: str | None = None
 
             if not crit_row or not weights_dict:
-                formula_text = "No existe una version activa de criterios y pesos normativos configurada."
-                explanation_text = "No se puede calcular puntuacion global explicable sin ponderaciones activas."
+                if not crit_row:
+                    formula_text = "No existe una version activa de criterios y pesos normativos configurada."
+                    explanation_text = "No se puede calcular puntuacion global explicable sin una version activa de criterios."
+                    score_blocker_reason = (
+                        "No existe una version activa de criterios y pesos normativos configurada "
+                        "para calcular la puntuacion global valida (CA-HU1.12-02 / CA-HU1.12-03)."
+                    )
+                else:
+                    formula_text = (
+                        f"La version activa de criterios v{crit_row['version_number']} no tiene pesos configurados."
+                    )
+                    explanation_text = "No se puede calcular puntuacion global explicable sin ponderaciones activas."
+                    score_blocker_reason = (
+                        f"La version activa de criterios v{crit_row['version_number']} no tiene pesos asignados "
+                        "para calcular una puntuacion global valida (CA-HU1.12-02 / CA-HU1.12-03)."
+                    )
             elif not is_complete:
                 missing_str = ", ".join(missing_dimensions)
                 formula_text = f"Puntuacion no calculable: faltan dimensiones indispensables ({missing_str})."
@@ -5607,18 +9159,27 @@ class PlatformService:
                 )
             else:
                 unscored_criteria = [
-                    code for code in weights_dict
-                    if code in ("ECONOMIC", "SOCIAL", "ENVIRONMENTAL", "TECHNICAL") and code not in input_scores_dict
+                    code for code, weight in weights_dict.items()
+                    if weight > 0 and code not in input_scores_dict
                 ]
                 if unscored_criteria:
-                    formula_text = f"Puntuacion no calculable: faltan puntuaciones cuantitativas para criterios ponderados ({', '.join(unscored_criteria)})."
+                    missing_scores_str = ", ".join(unscored_criteria)
+                    formula_text = f"Puntuacion no calculable: faltan puntuaciones cuantitativas para criterios ponderados ({missing_scores_str})."
                     explanation_text = "Se requiere registrar puntuacion valida para todos los criterios con peso asignado."
+                    score_blocker_reason = (
+                        f"Falta puntuacion cuantitativa valida para criterio(s) ponderado(s) ({missing_scores_str}); "
+                        "no es posible aprobar sin puntuacion global valida (CA-HU1.12-02 / CA-HU1.12-03)."
+                    )
                 else:
+                    weighted_codes = [
+                        code for code, weight in weights_dict.items()
+                        if weight > 0 and code in input_scores_dict
+                    ]
                     weighted_sum = sum(
                         input_scores_dict[code] * (weights_dict[code] / 100.0)
-                        for code in weights_dict if code in input_scores_dict
+                        for code in weighted_codes
                     )
-                    total_weight = sum(weights_dict[code] for code in weights_dict if code in input_scores_dict)
+                    total_weight = sum(weights_dict[code] for code in weighted_codes)
                     if total_weight > 0:
                         calc_score = round(weighted_sum * (100.0 / total_weight), 2)
                         global_score_val = calc_score
@@ -5626,18 +9187,35 @@ class PlatformService:
 
                         terms = [
                             f"[{code}: {input_scores_dict[code]:.1f} * {weights_dict[code]:.1f}%]"
-                            for code in weights_dict if code in input_scores_dict
+                            for code in weighted_codes
                         ]
                         formula_text = f"({' + '.join(terms)}) / {total_weight:.1f}% = {calc_score:.2f} pts"
                         explanation_text = (
                             f"Puntuacion global consolidada calculada a partir de la version activa de criterios v{crit_row['version_number']}. "
                             f"Ponderacion aplicada sobre {len(terms)} criterio(s) cuantitativo(s)."
                         )
+                    else:
+                        formula_text = "Puntuacion no calculable: la suma de pesos activos para dimensiones cuantitativas evaluadas es 0%."
+                        explanation_text = "Configure pesos mayores a 0% para al menos una dimension cuantitativa evaluada."
+                        score_blocker_reason = (
+                            "La suma de pesos cuantitativos en la politica activa de criterios es 0%; "
+                            "no es posible aprobar sin una puntuacion global calculable (CA-HU1.12-02 / CA-HU1.12-03)."
+                        )
+
+            if is_complete and (not is_score_calculated or global_score_val is None):
+                blocking_reasons.append(
+                    score_blocker_reason
+                    or "No se dispone de una puntuacion global valida bajo la politica activa de criterios (CA-HU1.12-02 / CA-HU1.12-03)."
+                )
 
             has_blockers = (len(blocking_reasons) > 0)
             if has_blockers:
                 summary_status = "blocked"
-                summary_status_label = "Bloqueado por alertas o punto de control"
+                summary_status_label = (
+                    "Bloqueado: puntuacion global no calculable"
+                    if is_complete and not is_score_calculated and score_blocker_reason and len(blocking_reasons) == 1
+                    else "Bloqueado por alertas o punto de control"
+                )
             elif not is_complete:
                 summary_status = "incomplete"
                 summary_status_label = "Evaluacion multidimensional incompleta"
@@ -5645,7 +9223,12 @@ class PlatformService:
                 summary_status = "completed"
                 summary_status_label = "Evaluacion multidimensional completa"
 
-            allows_final_approval = (is_complete and not has_blockers)
+            allows_final_approval = bool(
+                is_complete
+                and not has_blockers
+                and is_score_calculated
+                and global_score_val is not None
+            )
 
             resumen_parts = [
                 f"Expediente {project['code']} (version {version_number}): "
@@ -5775,6 +9358,12 @@ class PlatformService:
                     if missing
                     else gscore.get("explanation") or "Puntuacion global no calculable."
                 )
+            elif (
+                row.get("estimated_budget_pen") is None
+                or row.get("beneficiaries_count") is None
+            ):
+                exclusion_code = "incomplete"
+                exclusion_reason = "Borrador sin presupuesto o beneficiarios completos; no comparable en ranking."
             elif (
                 row.get("eval_criteria_version_id") is not None
                 and row["eval_criteria_version_id"] != active_crit_id
@@ -6325,7 +9914,7 @@ class PlatformService:
                     "La evaluación multidimensional está incompleta o contiene dimensiones no conformes."
                 ]
                 raise ConfiguracionPMV1Error(
-                    "Aprobación final bloqueada por el resumen unificado (HU1.12): "
+                    "Aprobación final bloqueada por el resumen unificado multidimensional (HU1.12): "
                     + " ".join(str(reason) for reason in reasons)
                 )
 
@@ -6537,6 +10126,7 @@ class PlatformService:
     ) -> dict[str, Any]:
         """Evalúa la accesibilidad territorial en salud, educación y transporte (HU1.4)."""
         project = self.get_project(project_id)
+        self._ensure_complete_project(project)
         cleaned_key = idempotency_key.strip() if idempotency_key and idempotency_key.strip() else None
 
         if not _is_db_available(self.db_url):
@@ -6747,6 +10337,7 @@ class PlatformService:
     ) -> dict[str, Any]:
         """Evalúa el impacto ambiental territorial del proyecto (HU1.6)."""
         project = self.get_project(project_id)
+        self._ensure_complete_project(project)
         cleaned_key = idempotency_key.strip() if idempotency_key and idempotency_key.strip() else None
 
         if not _is_db_available(self.db_url):
@@ -7681,6 +11272,133 @@ class EnvironmentalAssessmentEngine:
         }
 
 
+class ApprovedSocioeconomicMethodCalculator(Protocol):
+    """Puerto de extensión para incorporar el método oficial de retorno socioeconómico cuando sea aprobado."""
+
+    method_name: str
+    method_version: str
+    formula: str
+    required_fields: tuple[str, ...]
+
+    def compute(
+        self,
+        *,
+        budget_pen: Decimal,
+        beneficiaries_count: int,
+        inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        ...
+
+
+class SocioeconomicReturnEngine:
+    """
+    Motor controlado para retorno socioeconómico (HU1.3 · CA-HU1.3-02 / CA-HU1.3-03).
+    Por defecto el cálculo está DESHABILITADO (`_APPROVED_METHOD = None`) porque no existe aún
+    un método institucional aprobado en SIPRIM; jamás inventa cifras ni sustituye por un ROI genérico.
+    """
+
+    DEFAULT_MISSING_REQUIREMENTS: ClassVar[tuple[str, ...]] = (
+        "Método de retorno socioeconómico aprobado formalmente (p. ej., VAN social, TIR social o ratio B/C)",
+        "Flujos anuales de beneficios sociales monetizados y fuentes trazables",
+        "Flujos anuales de costos de operación y mantenimiento (O&M)",
+        "Horizonte de evaluación del proyecto (años)",
+        "Tasa social de descuento vigente aprobada (MEF / Invierte.pe)",
+    )
+    _APPROVED_METHOD: ClassVar[ApprovedSocioeconomicMethodCalculator | None] = None
+
+    @classmethod
+    def evaluate(
+        cls,
+        *,
+        budget_pen: Decimal | None,
+        beneficiaries_count: int | None,
+        socioeconomic_inputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        missing_base: list[str] = []
+        if budget_pen is None or budget_pen <= 0:
+            missing_base.append("Presupuesto estimado (> 0)")
+        if beneficiaries_count is None or beneficiaries_count <= 0:
+            missing_base.append("Cantidad de beneficiarios (> 0)")
+
+        calculator = cls._APPROVED_METHOD
+        if calculator is None:
+            return {
+                "socioeconomic_return": None,
+                "socioeconomic_return_status": "not_calculable",
+                "socioeconomic_return_label": "No calculable",
+                "socioeconomic_return_reason": (
+                    "No existe un metodo aprobado de retorno socioeconomico (p. ej. VAN/TIR/B-C) "
+                    "ni datos trazables de beneficios monetizados, costos de operacion/mantenimiento "
+                    "y tasa social de descuento en el expediente; no se inventa ningun valor."
+                ),
+                "socioeconomic_return_integration_status": "disabled_pending_method_approval",
+                "socioeconomic_return_missing_requirements": [
+                    *missing_base,
+                    *cls.DEFAULT_MISSING_REQUIREMENTS,
+                ],
+                "socioeconomic_return_method": None,
+                "socioeconomic_return_variables": {},
+                "socioeconomic_return_sources": [],
+            }
+
+        data = socioeconomic_inputs or {}
+        missing_inputs = [*missing_base]
+        for req in calculator.required_fields:
+            val = data.get(req)
+            if val is None or (isinstance(val, (list, dict, str)) and not val):
+                missing_inputs.append(req)
+        sources = [
+            str(s).strip()
+            for s in (data.get("sources") or [])
+            if isinstance(s, str) and s.strip()
+        ]
+        if not sources:
+            missing_inputs.append("sources (fuentes verificables de beneficios y costos)")
+
+        if missing_inputs:
+            return {
+                "socioeconomic_return": None,
+                "socioeconomic_return_status": "not_calculable",
+                "socioeconomic_return_label": "Información insuficiente",
+                "socioeconomic_return_reason": (
+                    "Faltan entradas trazables para el método aprobado "
+                    f"{calculator.method_name} ({calculator.method_version}): "
+                    + ", ".join(missing_inputs)
+                ),
+                "socioeconomic_return_integration_status": "awaiting_complete_inputs",
+                "socioeconomic_return_missing_requirements": missing_inputs,
+                "socioeconomic_return_method": {
+                    "method_name": calculator.method_name,
+                    "method_version": calculator.method_version,
+                    "formula": calculator.formula,
+                },
+                "socioeconomic_return_variables": {},
+                "socioeconomic_return_sources": sources,
+            }
+
+        computed = calculator.compute(
+            budget_pen=Decimal(str(budget_pen)),
+            beneficiaries_count=int(beneficiaries_count),
+            inputs=data,
+        )
+        return {
+            "socioeconomic_return": computed["value"],
+            "socioeconomic_return_status": "calculated",
+            "socioeconomic_return_label": computed.get("label") or f"{computed['value']}",
+            "socioeconomic_return_reason": computed.get("reason")
+            or f"Calculado con método aprobado {calculator.method_name} ({calculator.method_version}).",
+            "socioeconomic_return_integration_status": "enabled_approved_method",
+            "socioeconomic_return_missing_requirements": [],
+            "socioeconomic_return_method": {
+                "method_name": calculator.method_name,
+                "method_version": calculator.method_version,
+                "formula": calculator.formula,
+            },
+            "socioeconomic_return_variables": dict(computed.get("variables") or {}),
+            "socioeconomic_return_sources": sources,
+        }
+
+
 class EconomicProcessor:
     """Consumidor propietario exclusivo de economic_db e idempotente por event_id."""
 
@@ -7854,6 +11572,17 @@ class CompletionProcessor:
                         "UPDATE projects SET status='pending_review', updated_at=now() WHERE id=%s",
                         (project_id,),
                     )
+                    conn.execute(
+                        """
+                        UPDATE evaluation_dimension_dispatches
+                        SET status = 'pending_review',
+                            status_label = 'Pendiente de revisión (HITL)',
+                            error_message = NULL,
+                            updated_at = now()
+                        WHERE project_version_id = %s AND dimension_code = 'economic'
+                        """,
+                        (project_version_id,),
+                    )
                     # Detención estricta: NO insertar en economic_result_projections para evaluaciones pausadas
                     return
 
@@ -7882,9 +11611,37 @@ class CompletionProcessor:
                     (evaluation_id,),
                 )
                 conn.execute(
-                    "UPDATE projects SET status='evaluated',updated_at=now() WHERE id=%s",
-                    (project_id,),
+                    """
+                    UPDATE evaluation_dimension_dispatches
+                    SET status = 'completed',
+                        status_label = 'Completado',
+                        result_reference_id = %s,
+                        summary = %s,
+                        error_message = NULL,
+                        updated_at = now()
+                    WHERE project_version_id = %s AND dimension_code = 'economic'
+                    """,
+                    (
+                        UUID(payload["economic_assessment_id"]),
+                        f"Costo por beneficiario S/ {payload['cost_per_beneficiary_pen']} ({payload['score_0_100']}/100).",
+                        project_version_id,
+                    ),
                 )
+                has_sibling_failure = bool(
+                    conn.execute(
+                        """
+                        SELECT 1 FROM evaluation_dimension_dispatches
+                        WHERE project_version_id = %s AND status = 'failed'
+                        LIMIT 1
+                        """,
+                        (project_version_id,),
+                    ).fetchone()
+                )
+                if not has_sibling_failure:
+                    conn.execute(
+                        "UPDATE projects SET status='evaluated',updated_at=now() WHERE id=%s",
+                        (project_id,),
+                    )
                 conn.execute(
                     """INSERT INTO audit_events (action,entity_type,entity_id,details)
                     VALUES ('EVALUATION_COMPLETED','evaluation',%s,%s)""",

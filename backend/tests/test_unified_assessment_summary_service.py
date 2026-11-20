@@ -5,7 +5,10 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from backend.application.services.pmv1_services import PlatformService
+from backend.application.services.pmv1_services import (
+    EconomicProcessor,
+    PlatformService,
+)
 from backend.domain.exceptions.pmv1_exceptions import RecursoPMV1NoEncontradoError, ConfiguracionPMV1Error
 from backend.infrastructure.config.settings import get_settings
 
@@ -717,3 +720,660 @@ def test_hu1_12_legal_dimension_in_requires_review_blocks_final_approval_and_mar
             idempotency_key=f"appr-fail-reqrev-{uuid4()}",
         )
     assert "requires_review" in str(exc_info.value)
+
+
+def _seed_social_inputs(conn, proj_id: UUID, code: str, categories: list[str]) -> None:
+    specs = {
+        "salud": ("Distancia a establecimiento de salud", 420.0, "metros", "RENAES MINSA Oficial"),
+        "educacion": ("Distancia a colegio publico", 310.0, "metros", "ESCALE MINEDU Oficial"),
+        "transporte": ("Tiempo al paradero troncal", 5.0, "minutos", "Plan Vial MPH"),
+    }
+    for cat in categories:
+        name, val, unit, src = specs[cat]
+        conn.execute(
+            """
+            INSERT INTO territorial_social_indicators (
+                id, project_id, project_code, category, indicator_name,
+                metric_value, metric_unit, has_sufficient_data, source_name, data_origin
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, 'public')
+            """,
+            (uuid4(), proj_id, code, cat, name, val, unit, src),
+        )
+    for dim, target, pop, pct, crit, pts, eff_expl in [
+        (
+            "genero",
+            "Mujeres jefas de hogar",
+            520,
+            52.00,
+            "Acceso equitativo en equipamiento vecinal",
+            5.00,
+            "Bonificacion por impacto favorable en equidad de genero.",
+        ),
+        (
+            "edad",
+            "Ninos, jovenes y adultos mayores",
+            340,
+            34.00,
+            "Atencion prioritaria intergeneracional",
+            5.00,
+            "Bonificacion por cobertura inclusiva en ciclo de vida.",
+        ),
+    ]:
+        conn.execute(
+            """
+            INSERT INTO project_demographic_equity_records (
+                id, project_id, project_code, dimension, has_sufficient_data, target_group,
+                aggregated_population, aggregated_percentage, equity_criterion, declared_benefit,
+                verifiable_data, has_favorable_evidence, score_effect_pts, effect_type,
+                effect_explanation, source_name, data_origin
+            ) VALUES (
+                %s, %s, %s, %s, TRUE, %s,
+                %s, %s, %s, 'Beneficio paritario',
+                'Padron INEI sectorial', TRUE, %s, 'favorable',
+                %s, 'INEI', 'public'
+            )
+            """,
+            (uuid4(), proj_id, code, dim, target, pop, pct, crit, pts, eff_expl),
+        )
+
+
+def _seed_environmental_inputs(conn, proj_id: UUID, code: str, *, include_green_area: bool = True) -> None:
+    conn.execute(
+        """
+        INSERT INTO project_environmental_records (
+            id, project_id, project_code, has_sufficient_data, environmental_component,
+            declared_impacts, declared_measures, verifiable_evidence,
+            proximity_to_water_meters, is_in_protected_or_risk_area, source_name, data_origin
+        ) VALUES (
+            %s, %s, %s, TRUE, 'aire_acustico_residuos',
+            'Polvo y ruido menor en obra', 'Riego periodico y cerco',
+            'Predio urbano consolidado fuera de faja marginal',
+            380.00, FALSE, 'CENEPRED / PDM Huancayo', 'public'
+        )
+        """,
+        (uuid4(), proj_id, code),
+    )
+    if include_green_area:
+        conn.execute(
+            """
+            INSERT INTO project_green_area_records (
+                id, project_id, project_code, has_sufficient_data, total_project_area_m2,
+                green_area_m2, green_area_percentage, delimitation_description,
+                declared_affectation, verifiable_affectation, affectation_type,
+                protection_measures, has_sufficient_measures, source_name, data_origin
+            ) VALUES (
+                %s, %s, %s, TRUE, 1200.00,
+                360.00, 30.00, 'Perimetro cerco vivo sector norte',
+                'Sin afectacion negativa', 'Conservacion de cobertura arborea',
+                'conservacion_positiva', 'Riego tecnificado y reposicion', TRUE,
+                'Catastro Ambiental MPH', 'public'
+            )
+            """,
+            (uuid4(), proj_id, code),
+        )
+
+
+def _seed_technical_params(conn, proj_id: UUID, version_id: UUID, *, q_adm: float = 1.50) -> None:
+    rows = [
+        ("mecanica_suelos", "Capacidad portante RNE E.050", "RNE E.050", "Regla E.050", "q_adm", q_adm, "kg/cm2", None, "EMS CIP 101"),
+        ("servicios_basicos", "Factibilidad SEDAM", "RNE OS.010", "Regla OS.010", "Factibilidad", None, None, "Factibilidad vigente SEDAM", "Certificado SEDAM 202"),
+        ("topografia_taludes", "Pendiente media RNE CE.020", "RNE CE.020", "Regla CE.020", "Pendiente media", 8.5, "%", None, "Plano Topografico 303"),
+        ("dimensionamiento_predio", "Area util de lote", "RNE A.010", "Regla A.010", "Area neta", 1200.0, "m2", None, "Partida SUNARP 404"),
+    ]
+    for code, name, norm_ref, rule, p_name, p_num, p_unit, p_txt, doc in rows:
+        conn.execute(
+            """
+            INSERT INTO project_technical_parameters (
+                id, project_id, project_version_id, criterion_code, criterion_name,
+                normative_reference, has_sufficient_data, parameter_name,
+                parameter_value_numeric, parameter_unit, parameter_value_text,
+                applied_rule, supporting_document, source_origin, is_simulated
+            ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, 'public', FALSE)
+            """,
+            (uuid4(), proj_id, version_id, code, name, norm_ref, p_name, p_num, p_unit, p_txt, rule, doc),
+        )
+
+
+def _seed_economic_completion(conn, version_id: UUID, criteria_id: UUID, budget: Decimal, beneficiaries: int) -> None:
+    eval_id = uuid4()
+    cost_pen, score_0_100 = EconomicProcessor.calculate(
+        budget=budget,
+        beneficiaries=beneficiaries,
+        excellent=Decimal("200.00"),
+        unacceptable=Decimal("500.00"),
+    )
+    conn.execute(
+        """
+        INSERT INTO evaluations (id, project_version_id, criteria_version_id, requested_by_user_id, idempotency_key, status)
+        VALUES (%s, %s, %s, %s, %s, 'completed')
+        """,
+        (eval_id, version_id, criteria_id, PLANNER_ID, str(uuid4())),
+    )
+    conn.execute(
+        """
+        INSERT INTO economic_result_projections (
+            evaluation_id, economic_assessment_id, cost_per_beneficiary_pen,
+            score_0_100, status, explanation, algorithm_version
+        ) VALUES (%s, %s, %s, %s, 'completed', %s, %s)
+        """,
+        (
+            eval_id,
+            uuid4(),
+            cost_pen,
+            score_0_100,
+            f"Costo unitario {cost_pen} PEN calculado por EconomicProcessor.",
+            "economic-v1.0",
+        ),
+    )
+
+
+def _seed_verified_legal(conn, proj_id: UUID, code: str, version_id: UUID) -> None:
+    conn.execute(
+        """
+        INSERT INTO legal_assessments (
+            id, project_id, project_code, project_version_id, status, summary,
+            findings_json, total_findings, verifiable_citations_count,
+            unverifiable_citations_count, requires_human_review, has_legal_alert, is_resolved
+        ) VALUES (
+            %s, %s, %s, %s, 'verified', 'Normativa urbanistica y competencias verificadas.',
+            '[]'::jsonb, 1, 1, 0, FALSE, FALSE, FALSE
+        )
+        """,
+        (uuid4(), proj_id, code, version_id),
+    )
+
+
+def test_hu1_12_e2e_real_engines_recognize_social_complete_and_formula(service, db_conn):
+    """
+    HU1.12 End-to-End con motores reales: SocialAccessibilityEngine ('complete'),
+    EnvironmentalAssessmentEngine ('sufficient' + green area score),
+    TechnicalFeasibilityEngine ('cumple'), EconomicProcessor y dictamen juridico verificado.
+    """
+    code = f"PRY-E2E-{uuid4().hex[:6]}"
+    proj_id, v1_id = _create_base_project(db_conn, code)
+
+    _seed_economic_completion(db_conn, v1_id, ACTIVE_CRITERIA_ID, Decimal("150000.00"), 1000)
+    _seed_social_inputs(db_conn, proj_id, code, ["salud", "educacion", "transporte"])
+    _seed_environmental_inputs(db_conn, proj_id, code, include_green_area=True)
+    _seed_technical_params(db_conn, proj_id, v1_id, q_adm=1.50)
+    _seed_verified_legal(db_conn, proj_id, code, v1_id)
+
+    soc_eval = service.evaluate_social_accessibility(proj_id, PLANNER_ID, f"soc-{uuid4()}")
+    env_eval = service.evaluate_environmental_assessment(proj_id, PLANNER_ID, f"env-{uuid4()}")
+    tech_eval = service.evaluate_technical_feasibility(proj_id, PLANNER_ID, f"tech-{uuid4()}")
+
+    assert soc_eval["status"] == "complete"
+    assert env_eval["status"] == "sufficient"
+    assert env_eval["environmental_score"] is not None
+    assert tech_eval["overall_result"] == "cumple"
+
+    res = service.get_unified_assessment_summary(proj_id)
+    dim_map = {d["dimension_code"]: d for d in res["dimensions"]}
+
+    assert res["is_complete"] is True
+    assert res["status"] == "completed"
+    assert res["allows_final_approval"] is True
+    assert res["missing_dimensions"] == []
+    assert res["blocking_reasons"] == []
+    assert all(d["status"] == "completed" for d in dim_map.values())
+    assert dim_map["social"]["status"] == "completed"
+    assert dim_map["social"]["status_label"] == "Completada"
+    assert res["global_score"]["is_calculated"] is True
+    assert res["global_score"]["score"] is not None
+    assert len(res["global_score"]["weights"]) >= 1
+    assert "=" in res["global_score"]["formula"]
+
+
+@pytest.mark.parametrize("soc_categories,expected_soc_status,expected_missing", [
+    (["salud", "educacion"], "warning", "Social (Parcial / Incompleta)"),
+    ([], "failed", "Social (Informacion insuficiente)"),
+])
+def test_hu1_12_e2e_social_partial_or_insufficient_blocks_even_with_100pct_economic_weight(
+    service, db_conn, soc_categories, expected_soc_status, expected_missing
+):
+    """
+    CA-HU1.12-03: Social real en 'partial' o 'insufficient' debe impedir completitud
+    y aprobacion definitiva incluso cuando ECONOMIC tiene peso 100% y SOCIAL 0%.
+    """
+    code = f"PRY-SOCB-{uuid4().hex[:6]}"
+    proj_id, v1_id = _create_base_project(db_conn, code)
+
+    crit_id = uuid4()
+    temp_ver = int(datetime.now(timezone.utc).timestamp()) % 1000000 + 20000 + (1 if soc_categories else 2)
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        db_conn.execute(
+            """
+            INSERT INTO criteria_versions (
+                id, version_number, status, excellent_cost_pen, unacceptable_cost_pen,
+                created_by_user_id, activated_at
+            ) VALUES (%s, %s, 'active', 200, 500, %s, now())
+            """,
+            (crit_id, temp_ver, ADMIN_ID),
+        )
+        db_conn.execute(
+            """
+            INSERT INTO criterion_weights (criteria_version_id, criterion_code, weight_percent)
+            VALUES (%s, 'ECONOMIC', 100.00), (%s, 'SOCIAL', 0.00)
+            """,
+            (crit_id, crit_id),
+        )
+
+        _seed_economic_completion(db_conn, v1_id, crit_id, Decimal("150000.00"), 1000)
+        if soc_categories:
+            _seed_social_inputs(db_conn, proj_id, code, soc_categories)
+        else:
+            db_conn.execute(
+                """
+                INSERT INTO territorial_social_indicators (
+                    id, project_id, project_code, category, indicator_name,
+                    metric_value, metric_unit, has_sufficient_data, source_name, data_origin
+                ) VALUES (%s, %s, %s, 'salud', 'Salud sin dato', NULL, NULL, FALSE, 'Sin dato', 'public')
+                """,
+                (uuid4(), proj_id, code),
+            )
+        _seed_environmental_inputs(db_conn, proj_id, code, include_green_area=True)
+        _seed_technical_params(db_conn, proj_id, v1_id, q_adm=1.50)
+        _seed_verified_legal(db_conn, proj_id, code, v1_id)
+
+        service.evaluate_social_accessibility(proj_id, PLANNER_ID, f"soc-{uuid4()}")
+        service.evaluate_environmental_assessment(proj_id, PLANNER_ID, f"env-{uuid4()}")
+        service.evaluate_technical_feasibility(proj_id, PLANNER_ID, f"tech-{uuid4()}")
+
+        res = service.get_unified_assessment_summary(proj_id)
+        soc_dim = next(d for d in res["dimensions"] if d["dimension_code"] == "social")
+
+        assert soc_dim["status"] == expected_soc_status
+        assert soc_dim["has_blocker"] is True
+        assert expected_missing in res["missing_dimensions"]
+        assert res["is_complete"] is False
+        assert res["allows_final_approval"] is False
+        assert res["status"] == "blocked"
+        assert res["global_score"]["is_calculated"] is False
+        assert res["global_score"]["score"] is None
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE id = %s", (crit_id,))
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))
+
+
+def test_hu1_12_e2e_technical_observado_blocks_approval_ranking_and_pdf_with_100pct_economic_weight(
+    service, db_conn
+):
+    """
+    CA-HU1.12-03 + integracion HU3.x/HU4.1/HU4.3:
+    Una evaluacion tecnica real con overall_result='observado' (is_viable=False) debe bloquear
+    allows_final_approval, rechazar submit_human_approval('approved') sin escrituras,
+    y excluir el expediente del ranking comparable (HU4.1) y del PDF (HU4.3) incluso con ECONOMIC=100%.
+    """
+    code = f"PRY-OBS-{uuid4().hex[:6]}"
+    proj_id, v1_id = _create_base_project(db_conn, code)
+
+    crit_id = uuid4()
+    temp_ver = int(datetime.now(timezone.utc).timestamp()) % 1000000 + 30000
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        db_conn.execute(
+            """
+            INSERT INTO criteria_versions (
+                id, version_number, status, excellent_cost_pen, unacceptable_cost_pen,
+                created_by_user_id, activated_at
+            ) VALUES (%s, %s, 'active', 200, 500, %s, now())
+            """,
+            (crit_id, temp_ver, ADMIN_ID),
+        )
+        db_conn.execute(
+            """
+            INSERT INTO criterion_weights (criteria_version_id, criterion_code, weight_percent)
+            VALUES (%s, 'ECONOMIC', 100.00), (%s, 'TECHNICAL', 0.00)
+            """,
+            (crit_id, crit_id),
+        )
+
+        _seed_economic_completion(db_conn, v1_id, crit_id, Decimal("150000.00"), 1000)
+        _seed_social_inputs(db_conn, proj_id, code, ["salud", "educacion", "transporte"])
+        _seed_environmental_inputs(db_conn, proj_id, code, include_green_area=True)
+        _seed_technical_params(db_conn, proj_id, v1_id, q_adm=0.65)
+        _seed_verified_legal(db_conn, proj_id, code, v1_id)
+
+        service.evaluate_social_accessibility(proj_id, PLANNER_ID, f"soc-{uuid4()}")
+        service.evaluate_environmental_assessment(proj_id, PLANNER_ID, f"env-{uuid4()}")
+        tech = service.evaluate_technical_feasibility(proj_id, PLANNER_ID, f"tech-{uuid4()}")
+        assert tech["overall_result"] == "observado"
+        assert tech["is_viable"] is False
+
+        db_conn.execute("UPDATE projects SET status = 'evaluated' WHERE id = %s", (proj_id,))
+
+        res = service.get_unified_assessment_summary(proj_id)
+        tech_dim = next(d for d in res["dimensions"] if d["dimension_code"] == "technical")
+
+        assert tech_dim["status"] == "warning"
+        assert tech_dim["status_label"] == "Observado"
+        assert tech_dim["has_blocker"] is True
+        assert "Tecnica (Observado)" in res["missing_dimensions"]
+        assert any("observado" in reason.lower() for reason in res["blocking_reasons"])
+        assert res["is_complete"] is False
+        assert res["status"] == "blocked"
+        assert res["allows_final_approval"] is False
+        assert res["global_score"]["is_calculated"] is False
+        assert res["global_score"]["score"] is None
+
+        approvals_before = db_conn.execute(
+            "SELECT COUNT(*) FROM human_approvals WHERE project_id = %s",
+            (proj_id,),
+        ).fetchone()[0]
+        with pytest.raises(ConfiguracionPMV1Error) as exc_info:
+            service.submit_human_approval(
+                project_id=proj_id,
+                actor_id=PLANNER_ID,
+                decision="approved",
+                justification="Intento de aprobacion con tecnica observada.",
+                conditions=None,
+                idempotency_key=f"appr-obs-{uuid4()}",
+            )
+        assert "observado" in str(exc_info.value).lower()
+        approvals_after = db_conn.execute(
+            "SELECT COUNT(*) FROM human_approvals WHERE project_id = %s",
+            (proj_id,),
+        ).fetchone()[0]
+        assert approvals_before == approvals_after == 0
+
+        ranking = service.get_project_map_ranking()
+        ranked_ids = {str(item["project_id"]) for item in ranking["ranked_projects"]}
+        excluded_map = {str(item["project_id"]): item for item in ranking["excluded_projects"]}
+        assert str(proj_id) not in ranked_ids
+        assert str(proj_id) in excluded_map
+        assert excluded_map[str(proj_id)]["exclusion_code"] == "blocked"
+
+        pdf_bytes, filename = service.export_prioritization_ranking_pdf()
+        assert pdf_bytes.startswith(b"%PDF-")
+        assert filename.endswith(".pdf")
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE id = %s", (crit_id,))
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))
+
+
+def test_hu1_12_e2e_environmental_missing_conservation_and_pending_economic_block_approval(service, db_conn):
+    """
+    CA-HU1.12-03: Ambiental sin datos/puntaje de areas verdes y Economica en 'queued'/'failed'
+    no se presentan nunca como completas ni aprobables, aun con peso 100% en otro criterio.
+    """
+    code_env = f"PRY-ENVM-{uuid4().hex[:6]}"
+    proj_env, v_env = _create_base_project(db_conn, code_env)
+
+    _seed_economic_completion(db_conn, v_env, ACTIVE_CRITERIA_ID, Decimal("150000.00"), 1000)
+    _seed_social_inputs(db_conn, proj_env, code_env, ["salud", "educacion", "transporte"])
+    _seed_environmental_inputs(db_conn, proj_env, code_env, include_green_area=False)
+    _seed_technical_params(db_conn, proj_env, v_env, q_adm=1.50)
+    _seed_verified_legal(db_conn, proj_env, code_env, v_env)
+
+    service.evaluate_social_accessibility(proj_env, PLANNER_ID, f"soc-{uuid4()}")
+    env_res = service.evaluate_environmental_assessment(proj_env, PLANNER_ID, f"env-{uuid4()}")
+    assert env_res["environmental_score"] is None
+    service.evaluate_technical_feasibility(proj_env, PLANNER_ID, f"tech-{uuid4()}")
+
+    summary_env = service.get_unified_assessment_summary(proj_env)
+    env_dim = next(d for d in summary_env["dimensions"] if d["dimension_code"] == "environmental")
+    assert env_dim["status"] == "failed"
+    assert env_dim["has_blocker"] is True
+    assert any("Ambiental" in m for m in summary_env["missing_dimensions"])
+    assert summary_env["is_complete"] is False
+    assert summary_env["allows_final_approval"] is False
+    assert summary_env["global_score"]["is_calculated"] is False
+
+    # Economica fallida o en cola
+    code_ec = f"PRY-ECF-{uuid4().hex[:6]}"
+    proj_ec, v_ec = _create_base_project(db_conn, code_ec)
+    db_conn.execute(
+        """
+        INSERT INTO evaluations (id, project_version_id, criteria_version_id, requested_by_user_id, idempotency_key, status, error_message)
+        VALUES (%s, %s, %s, %s, %s, 'failed', 'Timeout de cola economica')
+        """,
+        (uuid4(), v_ec, ACTIVE_CRITERIA_ID, PLANNER_ID, str(uuid4())),
+    )
+    _seed_social_inputs(db_conn, proj_ec, code_ec, ["salud", "educacion", "transporte"])
+    _seed_environmental_inputs(db_conn, proj_ec, code_ec, include_green_area=True)
+    _seed_technical_params(db_conn, proj_ec, v_ec, q_adm=1.50)
+    _seed_verified_legal(db_conn, proj_ec, code_ec, v_ec)
+    service.evaluate_social_accessibility(proj_ec, PLANNER_ID, f"soc-{uuid4()}")
+    service.evaluate_environmental_assessment(proj_ec, PLANNER_ID, f"env-{uuid4()}")
+    service.evaluate_technical_feasibility(proj_ec, PLANNER_ID, f"tech-{uuid4()}")
+
+    summary_ec = service.get_unified_assessment_summary(proj_ec)
+    econ_dim = next(d for d in summary_ec["dimensions"] if d["dimension_code"] == "economic")
+    assert econ_dim["status"] == "failed"
+    assert econ_dim["has_blocker"] is True
+    assert "Economica (Fallida)" in summary_ec["missing_dimensions"]
+    assert summary_ec["is_complete"] is False
+    assert summary_ec["allows_final_approval"] is False
+
+
+@pytest.mark.parametrize("roles,expected_status", [
+    (["PLANNER"], 200),
+    (["PLANNING_MANAGER"], 200),
+    (["ADMIN"], 200),
+    (["SUPERADMIN"], 200),
+    (["MAYOR"], 403),
+    (["AUDITOR"], 403),
+    (["LEGAL_ADVISOR"], 403),
+    (["CITIZEN"], 403),
+])
+def test_hu1_12_unified_summary_endpoint_rbac(db_conn, roles, expected_status):
+    """
+    HU1.12 RBAC: GET /unified-summary permite lectura a PLANNER, PLANNING_MANAGER, ADMIN y SUPERADMIN;
+    deniega con 403 a MAYOR, AUDITOR, LEGAL_ADVISOR y CITIZEN; y exige autenticacion (401).
+    PLANNING_MANAGER mantiene solo lectura (POST /social-assessment sigue en 403).
+    """
+    from fastapi.testclient import TestClient
+    from backend.main import create_app
+    from backend.infrastructure.config.dependencies import get_current_user
+
+    code = f"PRY-RBAC-{uuid4().hex[:6]}"
+    proj_id, _ = _create_base_project(db_conn, code)
+
+    unauth_app = create_app()
+    with TestClient(unauth_app) as anon_client:
+        anon_res = anon_client.get(f"/api/v1/projects/{proj_id}/unified-summary")
+        assert anon_res.status_code == 401
+
+    app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": str(PLANNER_ID),
+        "user_id": PLANNER_ID,
+        "roles": roles,
+        "email": f"{roles[0].lower()}@siprim.gob.pe",
+    }
+
+    with TestClient(app) as client:
+        res = client.get(f"/api/v1/projects/{proj_id}/unified-summary")
+        assert res.status_code == expected_status
+
+        if roles == ["PLANNING_MANAGER"]:
+            write_res = client.post(
+                f"/api/v1/projects/{proj_id}/social-assessment",
+                headers={"Idempotency-Key": f"mgr-deny-{uuid4()}"},
+            )
+            assert write_res.status_code == 403
+
+
+def _seed_five_complete_evaluated_dimensions(service: PlatformService, db_conn, code: str) -> tuple[UUID, UUID]:
+    proj_id, v1_id = _create_base_project(db_conn, code)
+    _seed_economic_completion(db_conn, v1_id, ACTIVE_CRITERIA_ID, Decimal("150000.00"), 1000)
+    _seed_social_inputs(db_conn, proj_id, code, ["salud", "educacion", "transporte"])
+    _seed_environmental_inputs(db_conn, proj_id, code, include_green_area=True)
+    _seed_technical_params(db_conn, proj_id, v1_id, q_adm=1.50)
+    _seed_verified_legal(db_conn, proj_id, code, v1_id)
+
+    service.evaluate_social_accessibility(proj_id, PLANNER_ID, f"soc-{uuid4()}")
+    service.evaluate_environmental_assessment(proj_id, PLANNER_ID, f"env-{uuid4()}")
+    service.evaluate_technical_feasibility(proj_id, PLANNER_ID, f"tech-{uuid4()}")
+    db_conn.execute("UPDATE projects SET status = 'evaluated' WHERE id = %s", (proj_id,))
+    return proj_id, v1_id
+
+
+def _assert_uncalculated_score_blocks_gates(service: PlatformService, db_conn, proj_id: UUID, expected_reason_token: str) -> None:
+    res = service.get_unified_assessment_summary(proj_id)
+
+    # Distincion estricta: 5 dimensiones evaluadas vs puntuacion global no calculable
+    assert res["is_complete"] is True
+    assert res["missing_dimensions"] == []
+    assert "Dimensiones finalizadas: 5/5" in res["summary_text"]
+    assert res["global_score"]["score"] is None
+    assert res["global_score"]["is_calculated"] is False
+    assert res["allows_final_approval"] is False
+    assert res["status"] == "blocked"
+    assert len(res["blocking_reasons"]) >= 1
+    assert any(expected_reason_token in r.lower() for r in res["blocking_reasons"]), res["blocking_reasons"]
+
+    gate = service.get_human_approval(proj_id)
+    assert gate["allows_final_approval"] is False
+
+    approvals_before = db_conn.execute(
+        "SELECT COUNT(*) FROM human_approvals WHERE project_id = %s",
+        (proj_id,),
+    ).fetchone()[0]
+    status_before = db_conn.execute("SELECT status FROM projects WHERE id = %s", (proj_id,)).fetchone()[0]
+
+    with pytest.raises(ConfiguracionPMV1Error) as exc_info:
+        service.submit_human_approval(
+            project_id=proj_id,
+            actor_id=PLANNER_ID,
+            decision="approved",
+            justification="Intento de aprobacion sin puntuacion global calculable.",
+            conditions=None,
+            idempotency_key=f"appr-nogs-{uuid4()}",
+        )
+    assert expected_reason_token in str(exc_info.value).lower()
+
+    approvals_after = db_conn.execute(
+        "SELECT COUNT(*) FROM human_approvals WHERE project_id = %s",
+        (proj_id,),
+    ).fetchone()[0]
+    status_after = db_conn.execute("SELECT status FROM projects WHERE id = %s", (proj_id,)).fetchone()[0]
+    assert approvals_before == approvals_after == 0
+    assert status_before == status_after == "evaluated"
+
+    ranking = service.get_project_map_ranking()
+    ranked_ids = {str(item["project_id"]) for item in ranking["ranked_projects"]}
+    excluded_ids = {str(item["project_id"]) for item in ranking["excluded_projects"]}
+    assert str(proj_id) not in ranked_ids
+    assert str(proj_id) in excluded_ids
+
+    pdf_bytes, filename = service.export_prioritization_ranking_pdf()
+    assert pdf_bytes.startswith(b"%PDF-")
+    assert filename.endswith(".pdf")
+
+
+def test_hu1_12_five_dimensions_complete_without_active_criteria_blocks_approval(service, db_conn):
+    """
+    Si las 5 dimensiones estan completas pero no existe una version activa de criterios,
+    global_score.is_calculated es False, allows_final_approval es False y todas las compuertas bloquean.
+    """
+    code = f"PRY-NOCRIT-{uuid4().hex[:6]}"
+    proj_id, _ = _seed_five_complete_evaluated_dimensions(service, db_conn, code)
+
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        _assert_uncalculated_score_blocks_gates(service, db_conn, proj_id, "version activa de criterios")
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))
+
+
+def test_hu1_12_five_dimensions_complete_without_weights_blocks_approval(service, db_conn):
+    """
+    Si existe version activa de criterios sin pesos en criterion_weights, aunque las 5 dimensiones
+    esten evaluadas, global_score no es calculable y se bloquea la aprobacion definitiva y el ranking.
+    """
+    code = f"PRY-NOWGT-{uuid4().hex[:6]}"
+    proj_id, _ = _seed_five_complete_evaluated_dimensions(service, db_conn, code)
+    crit_id = uuid4()
+    temp_ver = int(datetime.now(timezone.utc).timestamp()) % 1000000 + 40000
+
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        db_conn.execute(
+            """
+            INSERT INTO criteria_versions (
+                id, version_number, status, excellent_cost_pen, unacceptable_cost_pen,
+                created_by_user_id, activated_at
+            ) VALUES (%s, %s, 'active', 200, 500, %s, now())
+            """,
+            (crit_id, temp_ver, ADMIN_ID),
+        )
+        _assert_uncalculated_score_blocks_gates(service, db_conn, proj_id, "no tiene pesos")
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE id = %s", (crit_id,))
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))
+
+
+def test_hu1_12_five_dimensions_complete_with_zero_quantitative_weights_blocks_approval(service, db_conn):
+    """
+    Si todos los pesos cuantitativos activos suman 0%, no se inventa puntaje ni se permite
+    habilitar la aprobacion definitiva aunque las 5 dimensiones esten completas.
+    """
+    code = f"PRY-ZERO-{uuid4().hex[:6]}"
+    proj_id, _ = _seed_five_complete_evaluated_dimensions(service, db_conn, code)
+    crit_id = uuid4()
+    temp_ver = int(datetime.now(timezone.utc).timestamp()) % 1000000 + 41000
+
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        db_conn.execute(
+            """
+            INSERT INTO criteria_versions (
+                id, version_number, status, excellent_cost_pen, unacceptable_cost_pen,
+                created_by_user_id, activated_at
+            ) VALUES (%s, %s, 'active', 200, 500, %s, now())
+            """,
+            (crit_id, temp_ver, ADMIN_ID),
+        )
+        db_conn.execute(
+            """
+            INSERT INTO criterion_weights (criteria_version_id, criterion_code, weight_percent)
+            VALUES
+                (%s, 'ECONOMIC', 0.00),
+                (%s, 'SOCIAL', 0.00),
+                (%s, 'ENVIRONMENTAL', 0.00),
+                (%s, 'TECHNICAL', 0.00)
+            """,
+            (crit_id, crit_id, crit_id, crit_id),
+        )
+        _assert_uncalculated_score_blocks_gates(service, db_conn, proj_id, "es 0%")
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE id = %s", (crit_id,))
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))
+
+
+def test_hu1_12_five_dimensions_complete_with_missing_weighted_criterion_score_blocks_approval(service, db_conn):
+    """
+    Si la politica activa pondera un criterio con peso > 0 que carece de puntuacion cuantitativa
+    (p. ej. criterio adicional o sin nota), global_score.is_calculated es False y la aprobacion se bloquea.
+    """
+    code = f"PRY-MISSC-{uuid4().hex[:6]}"
+    proj_id, _ = _seed_five_complete_evaluated_dimensions(service, db_conn, code)
+    crit_id = uuid4()
+    temp_ver = int(datetime.now(timezone.utc).timestamp()) % 1000000 + 42000
+
+    try:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE status = 'active'")
+        db_conn.execute(
+            """
+            INSERT INTO criteria_versions (
+                id, version_number, status, excellent_cost_pen, unacceptable_cost_pen,
+                created_by_user_id, activated_at
+            ) VALUES (%s, %s, 'active', 200, 500, %s, now())
+            """,
+            (crit_id, temp_ver, ADMIN_ID),
+        )
+        db_conn.execute(
+            """
+            INSERT INTO criterion_weights (criteria_version_id, criterion_code, weight_percent)
+            VALUES
+                (%s, 'ECONOMIC', 60.00),
+                (%s, 'LEGAL', 40.00)
+            """,
+            (crit_id, crit_id),
+        )
+        _assert_uncalculated_score_blocks_gates(service, db_conn, proj_id, "criterio(s) ponderado(s)")
+    finally:
+        db_conn.execute("UPDATE criteria_versions SET status = 'retired' WHERE id = %s", (crit_id,))
+        db_conn.execute("UPDATE criteria_versions SET status = 'active' WHERE id = %s", (ACTIVE_CRITERIA_ID,))

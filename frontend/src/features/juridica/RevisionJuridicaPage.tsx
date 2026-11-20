@@ -1,21 +1,65 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { evaluateLegalAssessment, getLegalAssessment, getProject, resolveLegalAlert } from '../../api/pmv1.api'
+import {
+  evaluateLegalAssessment,
+  getLegalAssessment,
+  getProcurementVerification,
+  getProject,
+  getZoningPrecheck,
+  requestProcurementVerification,
+  resolveLegalAlert,
+  reviewProcurementObservation,
+} from '../../api/pmv1.api'
 import { useAuth } from '../auth/AuthContext'
 import { newIdempotencyKey } from '../../utils/idempotency'
 import { ProyectoCard } from '../../components/proyecto/ProyectoCard'
 import { Alert } from '../../components/ui/Alert'
 import { PageHeader } from '../../components/ui/PageHeader'
 import { TechnicalDetails } from '../../components/ui/TechnicalDetails'
-import type { LegalAssessmentResponse, PMV1ProjectResponse } from '../../types/pmv1'
+import type {
+  LegalAssessmentResponse,
+  PMV1ProjectResponse,
+  ProcurementVerificationResponse,
+  ZoningPrecheckResponse,
+} from '../../types/pmv1'
 import { getPhysicalExpediente } from '../../utils/physicalExpedienteStorage'
 import { mapPmV1ToProyecto } from '../../utils/pmv1Mapper'
+
+const LEGAL_MISSING_LABELS: Record<string, string> = {
+  title: 'Nombre del proyecto',
+  description: 'Descripción',
+  location: 'Ubicación territorial',
+  proposed_land_use: 'Uso de suelo propuesto',
+  estimated_budget_pen: 'Presupuesto estimado (S/)',
+  beneficiaries_count: 'Beneficiarios estimados',
+}
+
+function getMissingFieldsForLegal(p: PMV1ProjectResponse | null): string[] {
+  if (!p) return []
+  const missing: string[] = []
+  if (!p.title || !p.title.trim()) missing.push(LEGAL_MISSING_LABELS.title)
+  if (!p.description || !p.description.trim()) missing.push(LEGAL_MISSING_LABELS.description)
+  if (!p.location || !p.location.trim()) missing.push(LEGAL_MISSING_LABELS.location)
+  if (!p.proposed_land_use || !p.proposed_land_use.trim()) missing.push(LEGAL_MISSING_LABELS.proposed_land_use)
+  if (p.estimated_budget_pen === null || p.estimated_budget_pen === undefined || Number(p.estimated_budget_pen) <= 0) {
+    missing.push(LEGAL_MISSING_LABELS.estimated_budget_pen)
+  }
+  if (p.beneficiaries_count === null || p.beneficiaries_count === undefined || Number(p.beneficiaries_count) <= 0) {
+    missing.push(LEGAL_MISSING_LABELS.beneficiaries_count)
+  }
+  return missing
+}
 
 export function RevisionJuridicaPage() {
   const { projectId = '' } = useParams()
   const { hasRole } = useAuth()
   const [project, setProject] = useState<PMV1ProjectResponse | null>(null)
   const [assessment, setAssessment] = useState<LegalAssessmentResponse | null>(null)
+  const [zoningPrecheckState, setZoningPrecheckState] = useState<ZoningPrecheckResponse | null>(null)
+  const [procVerification, setProcVerification] = useState<ProcurementVerificationResponse | null>(null)
+  const [procReviewStatus, setProcReviewStatus] = useState<'validated_compatible' | 'confirmed_incompatibility' | 'subsanacion_requerida'>('subsanacion_requerida')
+  const [procReviewNotes, setProcReviewNotes] = useState('')
+  const [procReviewSubmitting, setProcReviewSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -37,6 +81,20 @@ export function RevisionJuridicaPage() {
       .catch(() => {
         // No evaluado previamente
       })
+
+    getZoningPrecheck(projectId)
+      .then(setZoningPrecheckState)
+      .catch(() => {
+        // Sin precheck de zonificación registrado
+      })
+
+    getProcurementVerification(projectId)
+      .then((res) => {
+        if (res) setProcVerification(res)
+      })
+      .catch(() => {
+        // Sin verificación de contrataciones previa
+      })
   }, [projectId])
 
   const runReview = async () => {
@@ -54,6 +112,8 @@ export function RevisionJuridicaPage() {
   }
 
   const physicalExpediente = projectId ? getPhysicalExpediente(projectId) : null
+  const missingLegalFields = getMissingFieldsForLegal(project)
+  const isProjectCompleteForLegal = Boolean(project && missingLegalFields.length === 0)
 
   return (
     <div className="form-page pmv1-flow">
@@ -67,6 +127,314 @@ export function RevisionJuridicaPage() {
       {!project && !error && <p className="muted">Cargando expediente…</p>}
       {project && <ProyectoCard proyecto={mapPmV1ToProyecto(project)} compact />}
 
+      {zoningPrecheckState && (
+        <section
+          className="flow-panel"
+          data-testid="legal-zoning-observation"
+          style={{
+            borderLeft: `4px solid ${
+              zoningPrecheckState.compatible === false
+                ? '#dc2626'
+                : zoningPrecheckState.compatible === true
+                  ? '#16a34a'
+                  : '#d97706'
+            }`,
+            background:
+              zoningPrecheckState.compatible === false ? '#fef2f2' : '#f8fafc',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div>
+              <span className="story-label">PMV 1 · HU1.11 · Zonificación PDU/PDM</span>
+              <h3 style={{ margin: '0.2rem 0 0' }}>
+                {zoningPrecheckState.status_label ?? 'Observación territorial de zonificación'}
+              </h3>
+            </div>
+            <span
+              className={`status-pill ${
+                zoningPrecheckState.compatible === false
+                  ? 'status-error'
+                  : zoningPrecheckState.compatible === true
+                    ? 'status-approved'
+                    : 'status-review'
+              }`}
+            >
+              {zoningPrecheckState.compatible === false
+                ? 'Posible incompatibilidad (Revisión jurídica)'
+                : zoningPrecheckState.compatible === true
+                  ? 'Compatible preliminar'
+                  : 'Información insuficiente / Requiere revisión'}
+            </span>
+          </div>
+          {zoningPrecheckState.is_synthetic_data && (
+            <p
+              data-testid="legal-zoning-synthetic-banner"
+              style={{
+                margin: '0.5rem 0 0',
+                padding: '0.5rem 0.75rem',
+                background: '#ffedd5',
+                border: '1px solid #ea580c',
+                borderRadius: '6px',
+                color: '#9a3412',
+                fontSize: '0.82rem',
+                fontWeight: 700,
+              }}
+            >
+              DATOS SINTÉTICOS DE PRUEBA TÉCNICA (NO OFICIAL): esta alerta espacial proviene de un ensayo con polígono ficticio. No certifica zonificación ni infracción territorial real.
+            </p>
+          )}
+          {zoningPrecheckState.preliminary_conclusion && (
+            <p style={{ margin: '0.5rem 0 0', fontSize: '0.9rem' }}>
+              {zoningPrecheckState.preliminary_conclusion}
+            </p>
+          )}
+          <p style={{ margin: '0.4rem 0 0', fontSize: '0.84rem', color: '#475569' }}>
+            <strong>Limitaciones / Criterio humano:</strong> {zoningPrecheckState.limitations}
+          </p>
+          {zoningPrecheckState.environmental_risk_notice && (
+            <p
+              data-testid="legal-zoning-risk-notice"
+              style={{ margin: '0.45rem 0 0', fontSize: '0.83rem', color: '#9a3412', background: '#fff7ed', padding: '0.45rem 0.65rem', borderRadius: '6px' }}
+            >
+              <strong>Aviso de riesgo territorial:</strong> {zoningPrecheckState.environmental_risk_notice}
+            </p>
+          )}
+          {zoningPrecheckState.evidence && zoningPrecheckState.evidence.length > 0 && (
+            <div style={{ marginTop: '0.55rem', fontSize: '0.82rem', color: '#334155' }}>
+              <strong>Sustento principal:</strong> {zoningPrecheckState.evidence[0].document} (v.{' '}
+              {zoningPrecheckState.evidence[0].version}, {zoningPrecheckState.evidence[0].locator}) —{' '}
+              {zoningPrecheckState.evidence[0].excerpt}
+              {zoningPrecheckState.evidence[0].official_url && (
+                <>
+                  {' '}
+                  ·{' '}
+                  <a href={zoningPrecheckState.evidence[0].official_url} target="_blank" rel="noreferrer">
+                    {zoningPrecheckState.evidence[0].official_url}
+                  </a>
+                </>
+              )}
+            </div>
+          )}
+          {zoningPrecheckState.normative_amendments && zoningPrecheckState.normative_amendments.length > 0 && (
+            <div data-testid="legal-zoning-amendments" style={{ marginTop: '0.55rem', fontSize: '0.8rem', color: '#334155' }}>
+              <strong>Ordenanzas PDM verificadas por ámbito/predio:</strong>{' '}
+              {zoningPrecheckState.normative_amendments
+                .filter(
+                  (a) =>
+                    a.applicability_status === 'base_vigente' ||
+                    a.applicability_status === 'posible_coincidencia_pendiente_catastro' ||
+                    a.ordinance.includes('836') ||
+                    a.ordinance.includes('838') ||
+                    a.ordinance.includes('839'),
+                )
+                .map((a, idx) => (
+                  <span key={a.ordinance}>
+                    {idx > 0 ? ' · ' : ''}
+                    <a href={a.official_url} target="_blank" rel="noreferrer">
+                      {a.ordinance} ({a.publication_date})
+                    </a>
+                  </span>
+                ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {(procVerification || assessment?.procurement_verification) && (() => {
+        const pv = procVerification ?? assessment?.procurement_verification ?? null
+        if (!pv) return null
+        return (
+          <section
+            className="flow-panel"
+            data-testid="legal-procurement-observation"
+            style={{
+              borderLeft: `4px solid ${
+                pv.status === 'possible_incompatibility'
+                  ? '#dc2626'
+                  : pv.status === 'verified_preliminary'
+                    ? '#16a34a'
+                    : '#d97706'
+              }`,
+              background: pv.status === 'possible_incompatibility' ? '#fef2f2' : '#f8fafc',
+              display: 'grid',
+              gap: '0.65rem',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div>
+                <span className="story-label">PMV 1 · HU1.10 · Ley N.° 32069 y D.S. N.° 009-2025-EF</span>
+                <h3 style={{ margin: '0.2rem 0 0' }}>
+                  {pv.status_label} (Versión v{pv.version_number})
+                </h3>
+              </div>
+              <span
+                className={`status-pill ${
+                  pv.status === 'possible_incompatibility'
+                    ? 'status-error'
+                    : pv.status === 'verified_preliminary'
+                      ? 'status-approved'
+                      : 'status-review'
+                }`}
+              >
+                {pv.status === 'possible_incompatibility'
+                  ? 'Posible incompatibilidad (Revisión jurídica humana)'
+                  : pv.status === 'verified_preliminary'
+                    ? 'Preliminar compatible'
+                    : 'Requiere revisión'}
+              </span>
+            </div>
+
+            <p style={{ margin: 0, fontSize: '0.9rem', lineHeight: 1.45 }}>{pv.summary}</p>
+
+            {pv.affected_requirement && (
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#991b1b' }}>
+                <strong>Requisito contractual observado:</strong> {pv.affected_requirement}
+              </p>
+            )}
+
+            {pv.missing_fields.length > 0 && (
+              <p style={{ margin: 0, fontSize: '0.84rem', color: '#78350f' }}>
+                <strong>Antecedentes o sustentos faltantes:</strong> {pv.missing_fields.join('; ')}.
+              </p>
+            )}
+
+            <div style={{ display: 'grid', gap: '0.4rem' }}>
+              <strong style={{ fontSize: '0.83rem', color: '#0f172a' }}>
+                Requisitos examinados y fuentes oficiales OECE/MEF (consulta {pv.consulted_at}):
+              </strong>
+              {pv.examined_requirements.map((req) => (
+                <div
+                  key={req.requirement_code}
+                  style={{
+                    background: '#ffffff',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '6px',
+                    padding: '0.55rem 0.7rem',
+                    fontSize: '0.81rem',
+                  }}
+                >
+                  <div>
+                    <strong>{req.requirement_name}</strong> — <em>{req.status_label}</em>
+                  </div>
+                  <div style={{ color: '#334155', marginTop: '0.15rem' }}>{req.comparison_detail}</div>
+                  {req.norm_name && (
+                    <div style={{ color: '#475569', fontSize: '0.77rem', marginTop: '0.15rem' }}>
+                      {req.norm_name} ({req.norm_version}) · {req.article_or_section}
+                      {req.official_url && (
+                        <>
+                          {' '}·{' '}
+                          <a href={req.official_url} target="_blank" rel="noreferrer">
+                            {req.official_url}
+                          </a>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {pv.advisory_review_notes && (
+              <div
+                data-testid="procurement-advisor-decision-saved"
+                style={{
+                  background: '#ecfdf5',
+                  border: '1px solid #86efac',
+                  borderRadius: '6px',
+                  padding: '0.55rem 0.75rem',
+                  fontSize: '0.83rem',
+                  color: '#166534',
+                }}
+              >
+                <strong>Validación de Asesoría Jurídica ({pv.advisory_review_status}):</strong>{' '}
+                {pv.advisory_review_notes}
+              </div>
+            )}
+
+            {hasRole('LEGAL_ADVISOR') && (
+              <form
+                data-testid="procurement-advisor-review-form"
+                onSubmit={async (e) => {
+                  e.preventDefault()
+                  if (!projectId) return
+                  setProcReviewSubmitting(true)
+                  setError(null)
+                  try {
+                    const updated = await reviewProcurementObservation(projectId, {
+                      advisory_review_status: procReviewStatus,
+                      advisory_review_notes: procReviewNotes,
+                    })
+                    setProcVerification(updated)
+                    setSuccess('Validación jurídica contractual (HU1.10) registrada correctamente.')
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : 'No se pudo registrar la validación contractual.')
+                  } finally {
+                    setProcReviewSubmitting(false)
+                  }
+                }}
+                style={{
+                  background: '#ffffff',
+                  border: '1px solid #cbd5e1',
+                  borderRadius: '6px',
+                  padding: '0.75rem',
+                  display: 'grid',
+                  gap: '0.5rem',
+                }}
+              >
+                <strong style={{ fontSize: '0.84rem', color: '#0f172a' }}>
+                  Validación humana del Asesor Jurídico (HU1.10)
+                </strong>
+                <select
+                  data-testid="procurement-advisor-status-select"
+                  className="form-field-input"
+                  value={procReviewStatus}
+                  onChange={(e) =>
+                    setProcReviewStatus(
+                      e.target.value as 'validated_compatible' | 'confirmed_incompatibility' | 'subsanacion_requerida',
+                    )
+                  }
+                >
+                  <option value="subsanacion_requerida">Requiere subsanación de expediente / ajuste DEC</option>
+                  <option value="confirmed_incompatibility">Incompatibilidad confirmada por Asesoría Jurídica</option>
+                  <option value="validated_compatible">Subsanado / Compatible tras revisión humana</option>
+                </select>
+                <textarea
+                  data-testid="procurement-advisor-notes-input"
+                  rows={2}
+                  className="form-field-input"
+                  placeholder="Fundamentación jurídica del Asesor Legal sobre el requisito contractual observado..."
+                  value={procReviewNotes}
+                  onChange={(e) => setProcReviewNotes(e.target.value)}
+                  required
+                />
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    data-testid="procurement-advisor-submit-btn"
+                    disabled={procReviewSubmitting || procReviewNotes.trim().length < 5}
+                  >
+                    {procReviewSubmitting ? 'Registrando…' : 'Registrar validación contractual'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={loading}
+                    onClick={async () => {
+                      if (!projectId) return
+                      const refreshed = await requestProcurementVerification(projectId, newIdempotencyKey('proc-adv'))
+                      setProcVerification(refreshed)
+                    }}
+                  >
+                    Recalcular verificación Ley 32069
+                  </button>
+                </div>
+              </form>
+            )}
+          </section>
+        )
+      })()}
+
       <section className="flow-panel legal-flow-panel">
         <div className="flow-panel-heading">
           <div>
@@ -79,17 +447,28 @@ export function RevisionJuridicaPage() {
           Contrasta los antecedentes del expediente con el corpus normativo versionado y cita el artículo o sección exacta aplicable para su cotejo por el Asesor Jurídico, advirtiendo citas no verificables sin fabricar artículos.
         </p>
 
+        {project && !isProjectCompleteForLegal && (
+          <div data-testid="legal-incomplete-alert" style={{ marginBottom: '0.85rem' }}>
+            <Alert variant="error">
+              <strong>Evaluación jurídica bloqueada (expediente incompleto):</strong> complete en la ficha del proyecto los campos faltantes: {missingLegalFields.join(', ')}. La consulta normativa en solo lectura sigue disponible.
+            </Alert>
+          </div>
+        )}
+
         <button
           type="button"
           className="btn btn-primary"
-          disabled={loading || !project}
+          data-testid="evaluate-legal-btn"
+          disabled={loading || !project || !isProjectCompleteForLegal}
           onClick={() => void runReview()}
         >
           {loading
             ? 'Analizando normativa…'
-            : assessment
-            ? 'Actualizar revisión jurídica'
-            : 'Ejecutar revisión jurídica'}
+            : !isProjectCompleteForLegal && project
+              ? 'Evaluación jurídica bloqueada (datos incompletos)'
+              : assessment
+                ? 'Actualizar revisión jurídica'
+                : 'Ejecutar revisión jurídica'}
         </button>
 
         {assessment && (

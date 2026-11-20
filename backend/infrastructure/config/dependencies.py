@@ -191,6 +191,7 @@ def get_platform_service() -> PlatformService:
         settings.platform_db_url,
         dispatcher,
         enable_demo_fallback=settings.enable_demo_fallback,
+        enable_synthetic_zoning_rehearsal=settings.enable_synthetic_zoning_rehearsal,
     )
 
 

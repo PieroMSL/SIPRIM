@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { createProject } from '../../api/pmv1.api'
 import type { ProjectInput } from '../../types/proyecto'
+import { newIdempotencyKey } from '../../utils/idempotency'
 import {
   PHYSICAL_EXPEDIENTE_MAX_BYTES,
   savePhysicalExpediente,
@@ -52,46 +53,59 @@ export function useRegistrarProyecto() {
     setPhysicalFileError(null)
   }, [])
 
-  const submit = useCallback(async () => {
-    setSubmitError(null)
-    const errors = validateProyecto(form)
-    setFieldErrors(errors)
-    if (Object.keys(errors).length > 0) return
+  const submitWithMode = useCallback(
+    async (asDraft: boolean) => {
+      setSubmitError(null)
+      const errors = validateProyecto(form, { asDraft })
+      setFieldErrors(errors)
+      if (Object.keys(errors).length > 0) return
 
-    setLoading(true)
-    try {
-      const payload = normalizeProyectoForm(form)
-      const project = await createProject({
-        title: payload.nombre,
-        description: payload.descripcion,
-        location: 'El Tambo - Huancayo',
-        proposed_land_use: 'Infraestructura urbana',
-        estimated_budget_pen: payload.presupuesto,
-        beneficiaries_count: payload.beneficiarios,
-      })
+      setLoading(true)
+      try {
+        const payload = normalizeProyectoForm(form)
+        const project = await createProject(
+          {
+            title: payload.nombre,
+            description: payload.descripcion || undefined,
+            location: payload.ubicacion || undefined,
+            proposed_land_use: payload.usoSueloPropuesto || undefined,
+            estimated_budget_pen: payload.presupuesto > 0 ? payload.presupuesto : undefined,
+            beneficiaries_count: payload.beneficiarios > 0 ? payload.beneficiarios : undefined,
+            save_as_draft: asDraft,
+          },
+          newIdempotencyKey('proj'),
+        )
 
-      let mensaje = `Expediente registrado. Código: ${project.code}. Guarde este código para consultas.`
-      if (physicalFile) {
-        try {
-          await savePhysicalExpediente(project.project_id, physicalFile)
-          mensaje = `Expediente ${project.code} registrado. Archivo adjunto: ${physicalFile.name}.`
-        } catch (fileErr) {
-          mensaje =
-            fileErr instanceof Error
-              ? `Proyecto creado, pero no se guardó el archivo: ${fileErr.message}`
-              : 'Proyecto creado, pero no se pudo guardar el archivo adjunto.'
+        let mensaje =
+          project.status === 'draft'
+            ? `Borrador guardado en el servidor en estado pendiente de completar (${project.code}, ID: ${project.project_id}). Complete los datos obligatorios antes de evaluar.`
+            : `Expediente registrado en el servidor. Código: ${project.code} · ID: ${project.project_id} · Versión: v${project.version_number}. Puede consultarlo posteriormente sin volver a cargarlo.`
+        if (physicalFile) {
+          try {
+            await savePhysicalExpediente(project.project_id, physicalFile)
+            mensaje = `Expediente ${project.code} registrado en el servidor (v${project.version_number}). Archivo adjunto "${physicalFile.name}" conservado solo localmente en este navegador.`
+          } catch (fileErr) {
+            mensaje =
+              fileErr instanceof Error
+                ? `Proyecto creado, pero no se guardó el archivo: ${fileErr.message}`
+                : 'Proyecto creado, pero no se pudo guardar el archivo adjunto.'
+          }
         }
-      }
 
-      navigate(`/proyectos/${project.project_id}`, {
-        state: { mensaje },
-      })
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : 'No se pudo registrar el proyecto.')
-    } finally {
-      setLoading(false)
-    }
-  }, [form, navigate, physicalFile])
+        navigate(`/proyectos/${project.project_id}`, {
+          state: { mensaje },
+        })
+      } catch (err) {
+        setSubmitError(err instanceof Error ? err.message : 'No se pudo registrar el proyecto.')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [form, navigate, physicalFile],
+  )
+
+  const submit = useCallback(() => submitWithMode(false), [submitWithMode])
+  const saveDraft = useCallback(() => submitWithMode(true), [submitWithMode])
 
   return {
     form,
@@ -104,5 +118,6 @@ export function useRegistrarProyecto() {
     setPhysicalFile,
     resetForm,
     submit,
+    saveDraft,
   }
 }

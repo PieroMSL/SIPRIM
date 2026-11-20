@@ -100,6 +100,18 @@ export interface PMV1ProjectCreate {
   proposed_land_use?: string
   estimated_budget_pen?: number
   beneficiaries_count?: number
+  save_as_draft?: boolean
+}
+
+export interface PMV1ProjectUpdate {
+  title?: string
+  description?: string | null
+  location?: string | null
+  proposed_land_use?: string | null
+  estimated_budget_pen?: number | null
+  beneficiaries_count?: number | null
+  save_as_draft?: boolean
+  create_new_version?: boolean
 }
 
 export interface PMV1ProjectResponse {
@@ -113,28 +125,53 @@ export interface PMV1ProjectResponse {
   location: string | null
   proposed_land_use: string | null
   territorial_data_origin: string
-  estimated_budget_pen: number
-  beneficiaries_count: number
+  estimated_budget_pen: number | null
+  beneficiaries_count: number | null
   checkpoint?: CheckpointResponse | null
   pert_estimate?: PertEstimateResponse | null
   technical_assessment?: TechnicalFeasibilityResponse | null
+  economic_evaluation?: EvaluationResponse | null
+  zoning_precheck?: ZoningPrecheckResponse | null
+  dimension_dispatches?: DimensionDispatchStatusItem[]
+  has_failed_dimensions?: boolean
+  duplicated?: boolean
+}
+
+export interface DimensionDispatchStatusItem {
+  dimension_code: 'economic' | 'social' | 'environmental' | 'technical' | 'legal' | string
+  dimension_name: string
+  project_version_id: string
+  status: 'pending' | 'processing' | 'completed' | 'insufficient_data' | 'failed' | 'pending_review' | 'requires_review' | string
+  status_label: string
+  result_reference_id?: string | null
+  summary?: string | null
+  error_message?: string | null
+  attempt_count: number
+  dispatched_at?: string | null
+  updated_at?: string | null
 }
 
 export interface PMV1ValidationResponse {
   complete: boolean
   status: string
   missing_fields: string[]
+  missing_field_labels?: string[]
+  project_version_id?: string | null
+  version_number?: number | null
   message: string
 }
 
 export interface EvaluationAccepted {
   evaluation_id: string
   event_id?: string | null
+  project_version_id?: string | null
   status: string
   duplicated: boolean
   publication_pending: boolean
   status_label?: string | null
   checkpoint?: CheckpointResponse | null
+  dimension_dispatches?: DimensionDispatchStatusItem[]
+  has_failed_dimensions?: boolean
 }
 
 export interface EconomicResult {
@@ -143,7 +180,25 @@ export interface EconomicResult {
   score_0_100: number
   explanation: string
   algorithm_version: string
-  socioeconomic_return: null
+  indicator_name?: string
+  currency?: string
+  formula?: string
+  rounding_rule?: string
+  budget_pen?: number | null
+  beneficiaries_count?: number | null
+  socioeconomic_return: number | null
+  socioeconomic_return_status?: string
+  socioeconomic_return_label?: string
+  socioeconomic_return_reason?: string
+  socioeconomic_return_integration_status?: string
+  socioeconomic_return_missing_requirements?: string[]
+  socioeconomic_return_method?: {
+    method_name: string
+    method_version: string
+    formula: string
+  } | null
+  socioeconomic_return_variables?: Record<string, string | number>
+  socioeconomic_return_sources?: string[]
   warnings: string[]
 }
 
@@ -155,6 +210,8 @@ export interface EvaluationResponse {
   checkpoint?: CheckpointResponse | null
   status: string
   result: EconomicResult | null
+  dimension_dispatches?: DimensionDispatchStatusItem[]
+  has_failed_dimensions?: boolean
 }
 
 export interface NormativeCitationItem {
@@ -202,6 +259,106 @@ export interface LegalAlertResolutionResponse {
   duplicated?: boolean
 }
 
+export interface ProcurementAntecedentUpsert {
+  contracting_regime?: string | null
+  contract_object?: string | null
+  contracting_phase?: string | null
+  selection_procedure?: string | null
+  requirement_defined?: boolean | null
+  in_cmn_and_viability?: boolean | null
+  budget_certification_declared?: boolean | null
+  pladicop_registration_planned?: boolean | null
+  no_fractionation_declared?: boolean | null
+  supporting_document_ref?: string | null
+  contractual_summary?: string | null
+  data_origin?: 'declared' | 'simulated' | 'public'
+}
+
+export interface ProcurementNormativeSourceItem {
+  fragment_id: string
+  document_name: string
+  short_code: string
+  version: string
+  in_force: boolean
+  data_origin: string
+  effective_from?: string | null
+  consulted_at?: string | null
+  amendments_summary?: string | null
+  official_url?: string | null
+  status_note: string
+}
+
+export interface ProcurementAntecedentResponse {
+  project_id: string
+  project_version_id: string
+  version_number: number
+  has_record: boolean
+  contracting_regime?: string | null
+  contract_object?: string | null
+  contracting_phase?: string | null
+  selection_procedure?: string | null
+  requirement_defined?: boolean | null
+  in_cmn_and_viability?: boolean | null
+  budget_certification_declared?: boolean | null
+  pladicop_registration_planned?: boolean | null
+  no_fractionation_declared?: boolean | null
+  supporting_document_ref?: string | null
+  contractual_summary?: string | null
+  data_origin: string
+  updated_at?: string | null
+  active_normative_sources: ProcurementNormativeSourceItem[]
+  historical_normative_sources: ProcurementNormativeSourceItem[]
+}
+
+export interface ProcurementExaminedRequirementItem {
+  requirement_code: string
+  requirement_name: string
+  status: 'compliant_preliminary' | 'possible_incompatibility' | 'missing_data' | 'requires_review'
+  status_label: string
+  expedient_evidence: string
+  comparison_detail: string
+  norm_id?: string | null
+  norm_name?: string | null
+  norm_version?: string | null
+  article_or_section?: string | null
+  fragment_excerpt?: string | null
+  official_url?: string | null
+  consulted_at?: string | null
+  amendments_note?: string | null
+}
+
+export interface ProcurementAdvisorReviewRequest {
+  advisory_review_status: 'validated_compatible' | 'confirmed_incompatibility' | 'subsanacion_requerida'
+  advisory_review_notes: string
+}
+
+export interface ProcurementVerificationResponse {
+  verification_id: string
+  project_id: string
+  project_version_id: string
+  version_number: number
+  status: 'verified_preliminary' | 'possible_incompatibility' | 'requires_review'
+  status_label: string
+  preliminary_compliant: boolean | null
+  requires_human_review: boolean
+  certified_infraction: boolean
+  sent_to_legal_advisor: boolean
+  summary: string
+  affected_requirement?: string | null
+  observation_explanation?: string | null
+  missing_fields: string[]
+  examined_requirements: ProcurementExaminedRequirementItem[]
+  normative_sources: ProcurementNormativeSourceItem[]
+  superseded_sources_excluded: ProcurementNormativeSourceItem[]
+  advisory_review_status: string
+  advisory_reviewer_id?: string | null
+  advisory_review_notes?: string | null
+  advisory_reviewed_at?: string | null
+  consulted_at: string
+  duplicated: boolean
+  requested_at: string
+}
+
 export interface LegalAssessmentResponse {
   assessment_id: string
   project_id: string
@@ -223,6 +380,7 @@ export interface LegalAssessmentResponse {
   evaluated_at: string
   is_simulated_corpus: boolean
   duplicated?: boolean
+  procurement_verification?: ProcurementVerificationResponse | null
 }
 
 export interface LegalPrecheckResponse {
@@ -236,14 +394,51 @@ export interface LegalPrecheckResponse {
   findings?: LegalFindingItem[]
 }
 
+export interface ZoningEvidenceItem {
+  document: string
+  version: string
+  locator: string
+  excerpt: string
+  is_spatial_classification?: boolean
+  authority?: string | null
+  official_url?: string | null
+  in_force?: boolean | null
+  data_origin?: string | null
+}
+
+export interface NormativeAmendmentInfo {
+  ordinance: string
+  publication_date: string
+  relation_to_base: string
+  scope_type: string
+  scope_summary: string
+  applicability_status: string
+  official_url: string
+}
+
 export interface ZoningPrecheckResponse {
   review_id: string
   project_id: string
+  project_version_id?: string
   status: string
+  status_label?: string | null
   compatible: boolean | null
+  preliminary_conclusion?: string | null
+  flagged_for_legal_review?: boolean
+  location?: string
+  proposed_land_use?: string
+  territorial_data_origin?: string
+  coverage_status?: 'not_available' | 'inside_coverage' | 'outside_coverage'
+  is_synthetic_data?: boolean
+  provenance_mode?: string
+  base_ordinance_url?: string | null
+  normative_amendments?: NormativeAmendmentInfo[]
+  environmental_risk_notice?: string | null
+  evidence?: ZoningEvidenceItem[]
   requires_human_review: boolean
   alerts: string[]
   limitations: string
+  duplicated?: boolean
 }
 
 export interface NormativeChunkItem {
@@ -253,18 +448,47 @@ export interface NormativeChunkItem {
   version: string
   topic: string
   content: string
+  in_force?: boolean
   relevance_score: number
   has_alert: boolean
+  data_origin?: string
   location?: string | null
+  official_url?: string | null
+  consulted_at?: string | null
+  amendments_summary?: string | null
+  effective_from?: string | null
 }
 
 export interface NormativeSearchResponse {
   query: string
+  document_filter?: string | null
   total_results: number
   results: NormativeChunkItem[]
+  historical_references_excluded?: NormativeChunkItem[]
   alerts_found: string[]
   disclaimer: string
   requires_human_review: boolean
+  duplicated?: boolean
+  is_demo_fallback?: boolean
+}
+
+export interface NormativeDocumentItem {
+  short_code: string
+  document_name: string
+  version: string
+  in_force: boolean
+  data_origin: string
+  chunks_count: number
+  official_url?: string | null
+  consulted_at?: string | null
+  amendments_summary?: string | null
+  effective_from?: string | null
+}
+
+export interface NormativeDocumentListResponse {
+  total_documents: number
+  documents: NormativeDocumentItem[]
+  disclaimer: string
 }
 
 export interface HumanApprovalStatusResponse {

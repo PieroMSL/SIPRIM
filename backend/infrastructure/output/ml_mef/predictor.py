@@ -16,7 +16,7 @@ DIRECTORY = Path(__file__).parent
 @lru_cache(maxsize=1)
 def load_model() -> dict:
     try:
-        packed = base64.b64decode((DIRECTORY / "model.b64").read_text(), validate=False)
+        packed = base64.b64decode((DIRECTORY / "model.b64").read_text(encoding="utf-8"), validate=False)
         bundle = json.loads(gzip.decompress(packed))
         meta = bundle["metadata"]
         if meta["schema_version"] != 1 or meta["synthetic_data"] is not False:

@@ -10,6 +10,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from backend.application.services.pmv1_services import PlatformService
+from backend.domain.exceptions.pmv1_exceptions import ExpedientePMV1IncompletoError
 from backend.infrastructure.config.dependencies import get_platform_service, require_legal_or_planner, require_planner
 from backend.infrastructure.output.ml_mef.predictor import load_model, predict
 
@@ -38,6 +39,8 @@ def predict_project(project_id: UUID, payload: PredictionInput,
     project = platform.get_project(project_id)
     if str(project["project_version_id"]) != str(payload.project_version_id):
         raise HTTPException(409, "El expediente cambió de versión. Consúltelo de nuevo antes de predecir.")
+    if project.get("estimated_budget_pen") is None or float(project["estimated_budget_pen"]) <= 0:
+        raise ExpedientePMV1IncompletoError(["estimated_budget_pen"])
     categories = {"FUNCION": payload.function, "DEPARTAMENTO": payload.department,
                   "DES_MODALIDAD": payload.execution_mode, "TIPO_INVERSION": payload.investment_type}
     try:

@@ -16,7 +16,7 @@ from backend.infrastructure.output.ml_mef import predictor
 
 
 def test_export_matches_sklearn_on_real_reserved_records():
-    rows = json.loads((Path(predictor.__file__).parent / 'parity.json').read_text())
+    rows = json.loads((Path(predictor.__file__).parent / 'parity.json').read_text(encoding='utf-8'))
     for row in rows:
         result = predictor.predict(row['budget_pen'], row['categories'])
         assert result['cost_probability'] == pytest.approx(row['cost_probability'], abs=1e-12)

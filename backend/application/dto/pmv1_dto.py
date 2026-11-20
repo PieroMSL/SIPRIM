@@ -101,6 +101,7 @@ class PMV1ProjectCreate(BaseModel):
         default=None, max_digits=18, decimal_places=2
     )
     beneficiaries_count: int | None = None
+    save_as_draft: bool = False
 
     @field_validator("code")
     @classmethod
@@ -255,18 +256,88 @@ class PMV1ProjectResponse(BaseModel):
     longitude: float | None = None
     coordinates_origin: str | None = None
     coordinates_source: str | None = None
-    estimated_budget_pen: Decimal
-    beneficiaries_count: int
+    estimated_budget_pen: Decimal | None = None
+    beneficiaries_count: int | None = None
     checkpoint: CheckpointResponse | None = None
     pert_estimate: PertEstimateResponse | None = None
     technical_assessment: "TechnicalFeasibilityResponse | None" = None
+    economic_evaluation: "EvaluationResponse | None" = None
+    zoning_precheck: "ZoningPrecheckResponse | None" = None
+    dimension_dispatches: list["DimensionDispatchStatusItem"] = Field(default_factory=list)
+    has_failed_dimensions: bool = False
+    duplicated: bool = False
+
+
+class PMV1ProjectUpdate(BaseModel):
+    """Actualización o completado de un expediente PMV1 (borrador/versión editable)."""
+
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=4000)
+    location: str | None = Field(default=None, max_length=300)
+    proposed_land_use: str | None = Field(default=None, max_length=150)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    coordinates_origin: Literal[
+        "declared", "official_cadastre", "field_survey", "public", "simulated"
+    ] | None = None
+    coordinates_source: str | None = Field(default=None, max_length=240)
+    estimated_budget_pen: Decimal | None = Field(
+        default=None, max_digits=18, decimal_places=2
+    )
+    beneficiaries_count: int | None = None
+    save_as_draft: bool = False
+    create_new_version: bool = False
+
+    @field_validator(
+        "title",
+        "description",
+        "location",
+        "proposed_land_use",
+        "coordinates_source",
+        mode="before",
+    )
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def validate_coordinates_pair(self) -> "PMV1ProjectUpdate":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("Debe proporcionar tanto latitud como longitud, o dejar ambas vacias")
+        if self.latitude is not None:
+            source = (self.coordinates_source or "").strip()
+            if len(source) < 3:
+                raise ValueError(
+                    "Si proporciona coordenadas geográficas, debe indicar la fuente verificable (mín. 3 caracteres)"
+                )
+        return self
 
 
 class PMV1ValidationResponse(BaseModel):
     complete: bool
     status: str
     missing_fields: list[str]
+    missing_field_labels: list[str] = Field(default_factory=list)
+    project_version_id: UUID | None = None
+    version_number: int | None = None
     message: str
+
+
+class DimensionDispatchStatusItem(BaseModel):
+    dimension_code: str
+    dimension_name: str
+    project_version_id: UUID
+    status: str
+    status_label: str
+    result_reference_id: UUID | None = None
+    summary: str | None = None
+    error_message: str | None = None
+    attempt_count: int = 1
+    dispatched_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class EvaluationCreate(BaseModel):
@@ -276,11 +347,21 @@ class EvaluationCreate(BaseModel):
 class EvaluationAccepted(BaseModel):
     evaluation_id: UUID
     event_id: UUID | None = None
+    project_version_id: UUID | None = None
     status: str
     status_label: str | None = None
     duplicated: bool
     publication_pending: bool
     checkpoint: CheckpointResponse | None = None
+    dimension_dispatches: list[DimensionDispatchStatusItem] = Field(default_factory=list)
+    has_failed_dimensions: bool = False
+
+
+SOCIOECONOMIC_RETURN_NOT_CALCULABLE_REASON = (
+    "No existe un metodo aprobado de retorno socioeconomico (p. ej. VAN/TIR/B-C) "
+    "ni datos trazables de beneficios monetizados, costos de operacion/mantenimiento "
+    "y tasa social de descuento en el expediente; no se inventa ningun valor."
+)
 
 
 class EconomicResult(BaseModel):
@@ -289,9 +370,31 @@ class EconomicResult(BaseModel):
     score_0_100: Decimal
     explanation: str
     algorithm_version: str
-    socioeconomic_return: None = None
+    indicator_name: str = "Costo por beneficiario"
+    currency: str = "PEN"
+    formula: str = "presupuesto / beneficiarios"
+    rounding_rule: str = "2 decimales (ROUND_HALF_UP)"
+    budget_pen: Decimal | None = None
+    beneficiaries_count: int | None = None
+    socioeconomic_return: Decimal | None = None
+    socioeconomic_return_status: str = "not_calculable"
+    socioeconomic_return_label: str = "No calculable"
+    socioeconomic_return_reason: str = SOCIOECONOMIC_RETURN_NOT_CALCULABLE_REASON
+    socioeconomic_return_integration_status: str = "disabled_pending_method_approval"
+    socioeconomic_return_missing_requirements: list[str] = Field(
+        default_factory=lambda: [
+            "Método de retorno socioeconómico aprobado formalmente (p. ej., VAN social, TIR social o ratio B/C)",
+            "Flujos anuales de beneficios sociales monetizados y fuentes trazables",
+            "Flujos anuales de costos de operación y mantenimiento (O&M)",
+            "Horizonte de evaluación del proyecto (años)",
+            "Tasa social de descuento vigente aprobada (MEF / Invierte.pe)",
+        ]
+    )
+    socioeconomic_return_method: dict[str, str] | None = None
+    socioeconomic_return_variables: dict[str, Any] = Field(default_factory=dict)
+    socioeconomic_return_sources: list[str] = Field(default_factory=list)
     warnings: list[str] = [
-        "No se calcula retorno socioeconomico sin beneficios monetizados y trazables."
+        "No se calcula retorno socioeconomico sin beneficios monetizados y trazables ni metodo aprobado."
     ]
 
 
@@ -303,6 +406,8 @@ class EvaluationResponse(BaseModel):
     status_label: str | None = None
     checkpoint: CheckpointResponse | None = None
     result: EconomicResult | None = None
+    dimension_dispatches: list[DimensionDispatchStatusItem] = Field(default_factory=list)
+    has_failed_dimensions: bool = False
 
 
 class LegalPrecheckResponse(BaseModel):
@@ -324,6 +429,21 @@ class ZoningEvidence(BaseModel):
     version: str
     locator: str
     excerpt: str
+    is_spatial_classification: bool = False
+    authority: str | None = None
+    official_url: str | None = None
+    in_force: bool | None = None
+    data_origin: str | None = None
+
+
+class NormativeAmendmentInfo(BaseModel):
+    ordinance: str
+    publication_date: str
+    relation_to_base: str
+    scope_type: str
+    scope_summary: str
+    applicability_status: str
+    official_url: str
 
 
 class ZoningPrecheckResponse(BaseModel):
@@ -331,10 +451,19 @@ class ZoningPrecheckResponse(BaseModel):
     project_id: UUID
     project_version_id: UUID
     status: str
+    status_label: str | None = None
     compatible: bool | None
+    preliminary_conclusion: str | None = None
+    flagged_for_legal_review: bool = False
     location: str
     proposed_land_use: str
     territorial_data_origin: str
+    coverage_status: Literal["not_available", "inside_coverage", "outside_coverage"] = "not_available"
+    is_synthetic_data: bool = False
+    provenance_mode: str = "unverified_abstention"
+    base_ordinance_url: str | None = None
+    normative_amendments: list[NormativeAmendmentInfo] = Field(default_factory=list)
+    environmental_risk_notice: str | None = None
     evidence: list[ZoningEvidence]
     alerts: list[str]
     limitations: str
@@ -374,6 +503,10 @@ class NormativeChunkItem(BaseModel):
     data_origin: str
     relevance_score: float
     location: str | None = None
+    official_url: str | None = None
+    consulted_at: str | None = None
+    amendments_summary: str | None = None
+    effective_from: str | None = None
 
 
 class NormativeSearchResponse(BaseModel):
@@ -383,10 +516,12 @@ class NormativeSearchResponse(BaseModel):
     document_filter: str | None
     total_results: int
     results: list[NormativeChunkItem]
+    historical_references_excluded: list[NormativeChunkItem] = Field(default_factory=list)
     alerts_found: list[str]
     disclaimer: str
     requires_human_review: bool
     duplicated: bool = False
+    is_demo_fallback: bool = False
 
 
 class NormativeDocumentItem(BaseModel):
@@ -398,6 +533,10 @@ class NormativeDocumentItem(BaseModel):
     in_force: bool
     data_origin: str
     chunks_count: int
+    official_url: str | None = None
+    consulted_at: str | None = None
+    amendments_summary: str | None = None
+    effective_from: str | None = None
 
 
 class NormativeDocumentListResponse(BaseModel):
@@ -641,6 +780,141 @@ class LegalAlertResolutionResponse(BaseModel):
     duplicated: bool = False
 
 
+class ProcurementAntecedentUpsert(BaseModel):
+    """Antecedentes contractuales estructurados por versión de expediente (HU1.10)."""
+
+    model_config = ConfigDict(extra="forbid")
+    contracting_regime: str | None = Field(default=None, max_length=40)
+    contract_object: str | None = Field(default=None, max_length=32)
+    contracting_phase: str | None = Field(default=None, max_length=40)
+    selection_procedure: str | None = Field(default=None, max_length=64)
+    requirement_defined: bool | None = None
+    in_cmn_and_viability: bool | None = None
+    budget_certification_declared: bool | None = None
+    pladicop_registration_planned: bool | None = None
+    no_fractionation_declared: bool | None = None
+    supporting_document_ref: str | None = Field(default=None, max_length=300)
+    contractual_summary: str | None = Field(default=None, max_length=2000)
+    data_origin: Literal["declared", "simulated", "public"] = "declared"
+
+    @field_validator(
+        "contracting_regime",
+        "contract_object",
+        "contracting_phase",
+        "selection_procedure",
+        "supporting_document_ref",
+        "contractual_summary",
+        mode="before",
+    )
+    @classmethod
+    def clean_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return trimmed if trimmed else None
+        return value
+
+
+class ProcurementNormativeSourceItem(BaseModel):
+    fragment_id: str
+    document_name: str
+    short_code: str
+    version: str
+    in_force: bool
+    data_origin: str
+    effective_from: str | None = None
+    consulted_at: str | None = None
+    amendments_summary: str | None = None
+    official_url: str | None = None
+    status_note: str
+
+
+class ProcurementAntecedentResponse(BaseModel):
+    project_id: UUID
+    project_version_id: UUID
+    version_number: int
+    has_record: bool = False
+    contracting_regime: str | None = None
+    contract_object: str | None = None
+    contracting_phase: str | None = None
+    selection_procedure: str | None = None
+    requirement_defined: bool | None = None
+    in_cmn_and_viability: bool | None = None
+    budget_certification_declared: bool | None = None
+    pladicop_registration_planned: bool | None = None
+    no_fractionation_declared: bool | None = None
+    supporting_document_ref: str | None = None
+    contractual_summary: str | None = None
+    data_origin: str = "declared"
+    updated_at: datetime | None = None
+    active_normative_sources: list[ProcurementNormativeSourceItem] = Field(default_factory=list)
+    historical_normative_sources: list[ProcurementNormativeSourceItem] = Field(default_factory=list)
+
+
+class ProcurementExaminedRequirementItem(BaseModel):
+    requirement_code: str
+    requirement_name: str
+    status: Literal[
+        "compliant_preliminary",
+        "possible_incompatibility",
+        "missing_data",
+        "requires_review",
+    ]
+    status_label: str
+    expedient_evidence: str
+    comparison_detail: str
+    norm_id: str | None = None
+    norm_name: str | None = None
+    norm_version: str | None = None
+    article_or_section: str | None = None
+    fragment_excerpt: str | None = None
+    official_url: str | None = None
+    consulted_at: str | None = None
+    amendments_note: str | None = None
+
+
+class ProcurementAdvisorReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    advisory_review_status: Literal[
+        "validated_compatible", "confirmed_incompatibility", "subsanacion_requerida"
+    ]
+    advisory_review_notes: str = Field(min_length=5, max_length=2000)
+
+    @field_validator("advisory_review_notes")
+    @classmethod
+    def clean_notes(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 5:
+            raise ValueError("La observación del asesor jurídico debe tener al menos 5 caracteres.")
+        return trimmed
+
+
+class ProcurementVerificationResponse(BaseModel):
+    verification_id: UUID
+    project_id: UUID
+    project_version_id: UUID
+    version_number: int
+    status: Literal["verified_preliminary", "possible_incompatibility", "requires_review"]
+    status_label: str
+    preliminary_compliant: bool | None = None
+    requires_human_review: bool = True
+    certified_infraction: bool = False
+    sent_to_legal_advisor: bool = False
+    summary: str
+    affected_requirement: str | None = None
+    observation_explanation: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    examined_requirements: list[ProcurementExaminedRequirementItem] = Field(default_factory=list)
+    normative_sources: list[ProcurementNormativeSourceItem] = Field(default_factory=list)
+    superseded_sources_excluded: list[ProcurementNormativeSourceItem] = Field(default_factory=list)
+    advisory_review_status: str = "pending"
+    advisory_reviewer_id: UUID | None = None
+    advisory_review_notes: str | None = None
+    advisory_reviewed_at: datetime | None = None
+    consulted_at: str = "2026-11-20"
+    duplicated: bool = False
+    requested_at: datetime
+
+
 class LegalAssessmentResponse(BaseModel):
     assessment_id: UUID
     project_id: UUID
@@ -662,6 +936,7 @@ class LegalAssessmentResponse(BaseModel):
     evaluated_at: datetime
     is_simulated_corpus: bool = True
     duplicated: bool = False
+    procurement_verification: ProcurementVerificationResponse | None = None
 
 
 
@@ -787,8 +1062,8 @@ class RankingProjectItem(BaseModel):
     title: str
     status: str
     location: str | None = None
-    estimated_budget_pen: Decimal
-    beneficiaries_count: int
+    estimated_budget_pen: Decimal | None = None
+    beneficiaries_count: int | None = None
     global_score: float
     formula: str
     explanation: str
@@ -1037,8 +1312,8 @@ class HistoryVersionSummaryItem(BaseModel):
     project_version_id: UUID
     version_number: int
     title: str
-    estimated_budget_pen: Decimal
-    beneficiaries_count: int
+    estimated_budget_pen: Decimal | None = None
+    beneficiaries_count: int | None = None
     created_by_user_id: UUID
     created_by_name: str | None = None
     created_at: datetime

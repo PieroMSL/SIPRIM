@@ -4,6 +4,8 @@ export type EvaluationStatus = 'pendiente' | 'procesando' | 'completado' | 'fall
 export interface ProjectInput {
   nombre: string
   descripcion: string
+  ubicacion?: string
+  usoSueloPropuesto?: string
   presupuesto: number
   beneficiarios: number
 }
@@ -111,12 +113,18 @@ export interface ProyectoCreate {
   tipo_proyecto: string
 }
 
-export interface Proyecto extends ProyectoCreate {
+export interface Proyecto {
   id: string
   project_version_id?: string
   codigo?: string
   estado: string
   fecha_creacion: string
+  nombre: string
+  descripcion: string
+  ubicacion: string
+  presupuesto: number | null
+  beneficiarios: number | null
+  tipo_proyecto: string
 }
 
 export interface LegacyProyecto extends LegacyProyectoCreate {

@@ -1,5 +1,5 @@
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response, status
 
@@ -32,8 +32,13 @@ from backend.application.dto.pmv1_dto import (
     NormativeSearchResponse,
     PertEstimateCreate,
     PertEstimateResponse,
+    ProcurementAdvisorReviewRequest,
+    ProcurementAntecedentResponse,
+    ProcurementAntecedentUpsert,
+    ProcurementVerificationResponse,
     PMV1ProjectCreate,
     PMV1ProjectResponse,
+    PMV1ProjectUpdate,
     PMV1ValidationResponse,
     GeospatialLayerCreate,
     GeospatialLayerItem,
@@ -174,7 +179,12 @@ def create_project(
     data: PMV1ProjectCreate,
     user: Annotated[dict[str, Any], Depends(require_planner)],
     service: Annotated[PlatformService, Depends(get_platform_service)],
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=120)
+    ] = None,
 ) -> dict[str, Any]:
+    if idempotency_key and idempotency_key.strip():
+        return service.create_project(data, UUID(user["sub"]), idempotency_key=idempotency_key.strip())
     return service.create_project(data, UUID(user["sub"]))
 
 
@@ -229,6 +239,16 @@ def get_project(
     service: Annotated[PlatformService, Depends(get_platform_service)],
 ) -> dict[str, Any]:
     return service.get_project(project_id)
+
+
+@router.put("/projects/{project_id}", response_model=PMV1ProjectResponse)
+def update_project(
+    project_id: Annotated[UUID, Path()],
+    data: PMV1ProjectUpdate,
+    user: Annotated[dict[str, Any], Depends(require_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+) -> dict[str, Any]:
+    return service.update_project(project_id=project_id, data=data, actor_id=UUID(user["sub"]))
 
 
 @router.get(
@@ -361,8 +381,9 @@ def validate_project(
     project_id: Annotated[UUID, Path()],
     _: Annotated[dict[str, Any], Depends(require_planner)],
     service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
 ) -> dict[str, Any]:
-    return service.validate_project(project_id)
+    return service.validate_project(project_id, version_id=version_id)
 
 
 @router.post(
@@ -377,18 +398,7 @@ async def evaluar_proyecto_pmv1_ia(
     ia_service: Annotated[IAServicePort, Depends(get_ia_service)],
 ) -> DictamenIAResponse:
     project = platform.get_project(project_id)
-    missing = [
-        field
-        for field in (
-            "title",
-            "description",
-            "location",
-            "proposed_land_use",
-            "estimated_budget_pen",
-            "beneficiaries_count",
-        )
-        if project.get(field) in (None, "")
-    ]
+    missing = PlatformService._missing_from_values(project)
     if missing:
         raise ExpedientePMV1IncompletoError(missing)
     ficha = {
@@ -445,6 +455,25 @@ def get_evaluation(
     service: Annotated[PlatformService, Depends(get_platform_service)],
 ) -> dict[str, Any]:
     return service.get_evaluation(evaluation_id)
+
+
+@router.post(
+    "/projects/{project_id}/evaluations/retry",
+    response_model=EvaluationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reintenta de forma segura únicamente las dimensiones fallidas o pendientes de la versión vigente (HU1.1)",
+)
+def retry_failed_evaluation_dimensions(
+    project_id: Annotated[UUID, Path()],
+    user: Annotated[dict[str, Any], Depends(require_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.retry_failed_dimensions(
+        project_id=project_id,
+        actor_id=UUID(user["sub"]),
+        version_id=version_id,
+    )
 
 
 @router.post(
@@ -511,6 +540,20 @@ def resolve_legal_alert(
         idempotency_key=idempotency_key,
         evidence_reference=payload.evidence_reference,
     )
+
+
+@router.get(
+    "/projects/{project_id}/zoning-precheck",
+    response_model=ZoningPrecheckResponse | None,
+    summary="Consulta en solo lectura el último precheck de zonificación PDU/PDM de la versión vigente (HU1.11)",
+)
+def get_zoning_precheck(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_legal_or_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any] | None:
+    return service.get_zoning_precheck(project_id, version_id=version_id)
 
 
 @router.post(
@@ -739,9 +782,108 @@ def get_technical_feasibility(
 )
 def get_unified_assessment_summary(
     project_id: Annotated[UUID, Path()],
-    _: Annotated[dict[str, Any], Depends(require_planner)],
+    _: Annotated[dict[str, Any], Depends(require_planner_or_manager)],
     service: Annotated[PlatformService, Depends(get_platform_service)],
     version_id: Annotated[UUID | None, Query()] = None,
 ) -> dict[str, Any]:
     return service.get_unified_assessment_summary(project_id=project_id, version_id=version_id)
+
+
+@router.get(
+    "/projects/{project_id}/procurement-antecedents",
+    response_model=ProcurementAntecedentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Consulta antecedentes contractuales estructurados y vigencia Ley N.° 32069 (HU1.10)",
+    tags=["Normativa y Legal"],
+)
+def get_procurement_antecedents(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_legal_or_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.get_procurement_antecedents(project_id=project_id, version_id=version_id)
+
+
+@router.put(
+    "/projects/{project_id}/procurement-antecedents",
+    response_model=ProcurementAntecedentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Registra antecedentes contractuales de la versión vigente del expediente (HU1.10)",
+    tags=["Normativa y Legal"],
+)
+def upsert_procurement_antecedents(
+    project_id: Annotated[UUID, Path()],
+    payload: ProcurementAntecedentUpsert,
+    user: Annotated[dict[str, Any], Depends(require_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.upsert_procurement_antecedents(
+        project_id=project_id,
+        actor_id=UUID(user["sub"]),
+        data=payload,
+        version_id=version_id,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/procurement-verification",
+    response_model=ProcurementVerificationResponse | None,
+    status_code=status.HTTP_200_OK,
+    summary="Consulta en solo lectura la verificación contra Ley de Contrataciones Públicas (HU1.10)",
+    tags=["Normativa y Legal"],
+)
+def get_procurement_verification(
+    project_id: Annotated[UUID, Path()],
+    _: Annotated[dict[str, Any], Depends(require_legal_or_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any] | None:
+    return service.get_procurement_verification(project_id=project_id, version_id=version_id)
+
+
+@router.post(
+    "/projects/{project_id}/procurement-verification",
+    response_model=ProcurementVerificationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Ejecuta verificación preliminar de Ley N.° 32069 y D.S. N.° 009-2025-EF (HU1.10)",
+    tags=["Normativa y Legal"],
+)
+def request_procurement_verification(
+    project_id: Annotated[UUID, Path()],
+    user: Annotated[dict[str, Any], Depends(require_legal_or_planner)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=120)] = None,
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.request_procurement_verification(
+        project_id=project_id,
+        actor_id=UUID(user["sub"]),
+        idempotency_key=idempotency_key or f"proc-verif-{uuid4()}",
+        version_id=version_id,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/procurement-verification/review",
+    response_model=ProcurementVerificationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Registra validación jurídica humana del Asesor Jurídico sobre observación contractual (HU1.10)",
+    tags=["Normativa y Legal"],
+)
+def review_procurement_observation(
+    project_id: Annotated[UUID, Path()],
+    payload: ProcurementAdvisorReviewRequest,
+    user: Annotated[dict[str, Any], Depends(require_legal_advisor)],
+    service: Annotated[PlatformService, Depends(get_platform_service)],
+    version_id: Annotated[UUID | None, Query()] = None,
+) -> dict[str, Any]:
+    return service.review_procurement_observation(
+        project_id=project_id,
+        actor_id=UUID(user["sub"]),
+        advisory_review_status=payload.advisory_review_status,
+        advisory_review_notes=payload.advisory_review_notes,
+        version_id=version_id,
+    )
 

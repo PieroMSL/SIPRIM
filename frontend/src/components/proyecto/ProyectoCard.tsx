@@ -15,6 +15,8 @@ function displayProjectId(proyecto: Proyecto): string {
 
 function getEstadoLabel(estado: string): string {
   switch (estado.toLowerCase()) {
+    case 'draft':
+      return 'Borrador incompleto'
     case 'pending_review':
       return 'Pendiente de revisión'
     case 'ready':
